@@ -1,17 +1,17 @@
 # Chess.com Lc0 Bot (Host Edition)
 
-An automated chess.com bot using **Lc0 (Leela Chess Zero)**. Built with an on-demand, process-isolated architecture to run stably on low-resource VPS environments (e.g., 1 Core CPU, 1GB RAM) indefinitely.
+An automated Chess.com companion bot utilizing Leela Chess Zero (Lc0). Designed with an on-demand, process-isolated architecture to run stably on low-resource VPS setups (e.g., 1 Core CPU, 1GB RAM) without memory leaks.
 
 ---
 
 ## Key Features
 
-- 🧠 **On-Demand Lc0 UCI Engine** — Starts when a game begins and shuts down immediately after to free RAM.
-- ⚡ **CDP Process Isolation** — Spawns a game-specific subprocess that connects to the main browser context via Chrome DevTools Protocol (CDP). All Lc0 and Python heap memory is fully reclaimed by the OS after each game.
-- 🤖 **Advanced Humanizer** — Real-time clock-aware Gaussian delays, time-pressure adjustments (flagging mode), blunder injection, and premoves.
-- 🔄 **Layered Board Parser** — Reconstructs game state via SAN move list replay (Strategy 1) for perfect FEN (castling/en-passant), with JS state and DOM fallbacks. Zero fragile React fiber walking.
-- 🔒 **Stealth & Persistence** — Puppeteer-stealth equivalent Playwright settings. Saves cookies/localStorage to bypass continuous logins. Supports credential-less `cookie_only` run mode.
-- 📱 **Async Webhook Notifier** — Non-blocking Discord/Telegram webhook integrations for game starts, results, limits, and errors.
+- **On-Demand UCI Engine Lifecycle** - Starts Lc0 only when a game begins and terminates the engine process immediately upon game end, keeping idle RAM usage minimal.
+- **CDP Process Isolation** - Spawns a dedicated game worker subprocess connecting to the host browser context via Chrome DevTools Protocol (CDP). All Lc0 and Python chess engine allocations are fully reclaimed by the operating system after each game.
+- **Dynamic Humanizer** - Implements Gaussian-delay models calibrated using time control constraints (Bullet, Blitz, Rapid, Classical) and remaining clock ratios. Simulates flagging urgency, blunder rates under pressure, and selective premoving.
+- **Multi-layered Board Parsing** - Primary board state reconstruction is powered by move-list SAN replay, ensuring perfect tracking of castling rights, en-passant states, and clock counters. Falls back to internal JavaScript state and DOM attributes. Avoids fragile React fiber walking.
+- **Stealth and Persistence** - Uses customized Playwright headers, browser footprint masking, and cookie/localStorage synchronization to persist active sessions and minimize login verification challenges. Supports credential-less runtime initialization.
+- **Asynchronous Webhook Notifications** - Features non-blocking integration with Discord and Telegram webhooks using `httpx` to publish logs, status updates, and game summaries without blocking active threads.
 
 ---
 
@@ -19,58 +19,62 @@ An automated chess.com bot using **Lc0 (Leela Chess Zero)**. Built with an on-de
 
 ```
 ├── bot/
-│   ├── main.py              # Orchestrator (Browser, challenge listening, subprocess spawner)
-│   ├── game_worker.py       # Game worker (CDP connect, engine loop, move maker)
-│   ├── board_parser.py      # DOM → Board parsing (Move replay primary)
-│   ├── session_manager.py   # Stealth browser launcher & login/cookie persist
-│   ├── challenge_listener.py# Challenge monitoring & auto-accept
-│   ├── humanizer.py         # Dynamic Gaussian delay & blunder calibration
-│   ├── move_maker.py        # Natural Bézier mouse clicks and dragging
-│   ├── lc0_engine.py        # UCI wrapper (detects Maia weights for nodes=1)
-│   ├── notifier.py          # Async Telegram/Discord webhook sender
-│   └── config.py            # YAML configurations parser & validator
+│   ├── main.py              # Orchestrator (Browser persistence, challenge monitoring, worker spawning)
+│   ├── game_worker.py       # Isolated worker (Engine uci control, game loops, click executions)
+│   ├── board_parser.py      # DOM state translation & move list history compilation
+│   ├── session_manager.py   # Stealth chromium instances & credential storage state manager
+│   ├── challenge_listener.py# Challenge state checkers & accept workflows
+│   ├── humanizer.py         # Delay calculations, blunder injections, and speed parameters
+│   ├── move_maker.py        # Natural Bézier mouse path movements and click timers
+│   ├── lc0_engine.py        # UCI engine communication handler (optimized for Maia nodes=1)
+│   ├── notifier.py          # Asynchronous Telegram and Discord message publishers
+│   └── config.py            # Configuration loading, merging, and validations
 ```
 
 ---
 
-## Quick Start (VPS Setup)
+## Installation and Setup
 
-### 1. Requirements & Dependencies
-Ensure you have Python 3.10+, Chromium dependencies, and `lc0` installed on your system.
+### 1. System Dependencies
+Install Python 3.10+, Chromium web browser, and Lc0.
 
 ```bash
-# Clone the repository and install requirements
+# Clone the repository
 git clone https://github.com/MuajAmin/chess.com-bot-host.git
 cd chess.com-bot-host
+
+# Install requirements
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. Configure the Bot
-Copy the template and edit it with your credentials, engine paths, and preferences:
+### 2. Configuration
+Copy the configuration template and populate it with your environment values:
 
 ```bash
 cp config.yaml.example config.yaml
 nano config.yaml
 ```
 
-**Minimal configuration (`config.yaml`):**
+**Example minimal `config.yaml`:**
 ```yaml
 account:
-  username: "your_username"
+  username: "your_chess_username"
   password: "your_password"
-  login_mode: "auto"           # auto | cookie_only | credentials
+  login_mode: "auto"           # Options: auto, cookie_only, credentials
 
 engine:
-  type: "auto"                 # maia | lc0 | auto
+  type: "auto"                 # Options: auto, maia, lc0
   path: "/usr/local/bin/lc0"
   weights: "/home/bot/weights/maia-1900.pb.gz"
 
 notifications:
-  webhook_url: "https://discord.com/api/webhooks/..." # optional
+  webhook_url: "https://discord.com/api/webhooks/..." # Leave blank to disable
 ```
 
-### 3. Run the Bot
+### 3. Execution
+Start the orchestrator process:
+
 ```bash
 python -m bot.main
 ```
@@ -79,4 +83,4 @@ python -m bot.main
 
 ## Disclaimer
 
-This bot is for educational and hobby purposes. Using chess automation on Chess.com violates their Terms of Service and **will result in a permanent account ban**. Use entirely at your own risk.
+This project is intended strictly for educational, research, and non-commercial purposes. Automating gameplay on Chess.com violates their Terms of Service and will result in permanent account termination. Use at your own discretion.
