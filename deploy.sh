@@ -12,6 +12,12 @@ echo "============================================"
 echo "  Chess.com Bot — Full Deploy"
 echo "============================================"
 
+# --- Install git if missing ---
+if ! command -v git &>/dev/null; then
+    echo "[*] Installing git..."
+    apt-get update -y && apt-get install -y git
+fi
+
 # --- Clone or update the repo ---
 BOT_DIR="/home/bot/chess.com_bot_host"
 
