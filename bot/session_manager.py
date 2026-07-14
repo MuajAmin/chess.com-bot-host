@@ -81,7 +81,8 @@ class SessionManager:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._context_age = 0  # Track how many games this context has served
-        self.MAX_CONTEXT_AGE = 3  # Recreate context every N games
+        self._ws_endpoint = None  # CDP WebSocket endpoint for subprocess sharing
+        self.MAX_CONTEXT_AGE = config.max_context_games if hasattr(config, 'max_context_games') else 3
 
     @property
     def page(self) -> Page:
@@ -129,8 +130,27 @@ class SessionManager:
                 "--single-process",              # Reduce memory
                 "--disable-features=site-per-process",  # Reduce memory
                 "--js-flags=--max-old-space-size=256",   # Limit V8 heap
+                "--remote-debugging-port=0",     # Dynamic port for CDP sharing
             ],
         )
+
+        # Capture WebSocket endpoint for CDP subprocess sharing
+        # Playwright stores this when launching with remote debugging enabled
+        try:
+            cdp = await self._browser.new_browser_cdp_session()
+            # Get browser info to construct ws endpoint
+            info = await cdp.send("Browser.getVersion")
+            await cdp.detach()
+            # The ws endpoint is available on the browser's connection
+            # Use Playwright's internal ws URL which is always available
+            ws_url = self._browser._channel._connection._transport._ws_endpoint
+            self._ws_endpoint = ws_url
+            logger.info("CDP endpoint captured for subprocess sharing.")
+        except Exception as e:
+            logger.warning(
+                "Could not capture CDP endpoint (subprocess mode unavailable): %s", e
+            )
+            self._ws_endpoint = None
 
         await self._create_context()
         logger.info("Browser launched with stealth configuration.")
