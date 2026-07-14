@@ -51,7 +51,7 @@ BOT_USER="bot"
 BOT_DIR="/home/bot/chess.com_bot_host"
 
 if ! id -u "$BOT_USER" >/dev/null 2>&1; then
-    useradd --system --create-home --home-dir /home/bot --shell /usr/sbin/nologin "$BOT_USER"
+    useradd --system --create-home --home-dir /home/bot --shell /usr/sbin/nologin --user-group "$BOT_USER"
 fi
 BOT_GROUP="$(id -gn "$BOT_USER")"
 
@@ -120,15 +120,15 @@ echo ""
 
 # --- Setup systemd service ---
 echo "Setting up systemd service..."
-cat > /etc/systemd/system/chess-bot.service << 'EOF'
+cat > /etc/systemd/system/chess-bot.service << EOF
 [Unit]
 Description=Chess.com Lc0 Bot
 After=network.target
 
 [Service]
 Type=simple
-User=bot
-Group=bot
+User=$BOT_USER
+Group=$BOT_GROUP
 UMask=0077
 WorkingDirectory=/home/bot/chess.com_bot_host
 ExecStart=/home/bot/chess.com_bot_host/venv/bin/python -m bot.main

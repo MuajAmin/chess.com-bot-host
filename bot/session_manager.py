@@ -108,7 +108,7 @@ class SessionManager:
         if self._ws_endpoint:
             return self._ws_endpoint
         raise RuntimeError(
-            "WebSocket endpoint not available. "
+            "CDP endpoint not available. "
             "Browser may have been launched without remote debugging."
         )
 

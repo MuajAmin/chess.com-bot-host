@@ -15,8 +15,8 @@ Process isolation model:
 - CDP endpoint shared via CDP_ENDPOINT env variable
 - Worker connects via connect_over_cdp() — no second browser
 
-Fallback: If CDP subprocess mode is unavailable (ws_endpoint capture
-failed), falls back to in-process game loop (original behavior).
+Fallback: If CDP subprocess mode is unavailable, falls back to the
+in-process game loop.
 """
 
 import asyncio
@@ -67,6 +67,8 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
     game_tracker.start_game()
     consecutive_errors = 0
     max_errors = 10
+    final_result = "completed"
+    duration = None
 
     while True:
         try:
@@ -74,7 +76,8 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
             is_ended, result = await game_tracker.detect_game_end()
             if is_ended:
                 logger.info("Game over! Result: %s", result)
-                game_tracker.end_game(result)
+                final_result = result or "completed"
+                duration = game_tracker.end_game(final_result)
                 await game_tracker.dismiss_end_modal()
                 break
 
@@ -98,7 +101,8 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 consecutive_errors += 1
                 if consecutive_errors >= max_errors:
                     logger.error("Too many errors. Aborting game.")
-                    game_tracker.end_game("error")
+                    final_result = "error"
+                    duration = game_tracker.end_game(final_result)
                     break
                 await asyncio.sleep(1)
                 continue
@@ -161,16 +165,20 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
 
         except asyncio.CancelledError:
             logger.info("Game cancelled.")
-            game_tracker.end_game("cancelled")
+            final_result = "cancelled"
+            duration = game_tracker.end_game(final_result)
             break
         except Exception as e:
             logger.error("Game loop error: %s", e, exc_info=True)
             consecutive_errors += 1
             if consecutive_errors >= max_errors:
                 logger.error("Too many errors. Aborting game.")
-                game_tracker.end_game("error")
+                final_result = "error"
+                duration = game_tracker.end_game(final_result)
                 break
             await asyncio.sleep(2)
+
+    return final_result, duration
 
 
 async def play_game_subprocess(ws_endpoint, config):
@@ -373,7 +381,7 @@ async def main():
                     await notifier.game_started(color_name)
 
                     try:
-                        await play_game_inprocess(
+                        fallback_result, fallback_duration = await play_game_inprocess(
                             session, config, board_parser,
                             engine, humanizer, move_maker, game_tracker,
                         )
@@ -386,11 +394,8 @@ async def main():
                         gc.collect()
 
                     await notifier.game_ended(
-                        "completed",
-                        duration_secs=(
-                            (datetime.now() - game_tracker._game_start_time).total_seconds()
-                            if game_tracker._game_start_time else None
-                        ),
+                        fallback_result,
+                        duration_secs=fallback_duration,
                     )
 
                 # Recreate browser context to prevent Chromium memory leaks

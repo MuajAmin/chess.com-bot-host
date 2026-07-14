@@ -100,6 +100,14 @@ class Config:
             return expanded
         return value
 
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
     def _validate(self):
         """Validate critical config values."""
         errors = []
@@ -259,7 +267,7 @@ class Config:
 
     @property
     def browser_no_sandbox(self):
-        return bool(self._data["server"].get("browser_no_sandbox", False))
+        return self._as_bool(self._data["server"].get("browser_no_sandbox", False))
 
     # --- Notifications ---
     @property

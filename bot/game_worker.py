@@ -169,7 +169,7 @@ async def worker_main():
     Worker entry point — connect to browser via CDP, play one game, exit.
 
     The main process provides:
-    - CDP_ENDPOINT env var: WebSocket URL for browser connection
+    - CDP_ENDPOINT env var: localhost Chrome DevTools endpoint
     - BOT_CONFIG env var: Path to config.yaml
     """
     cdp_url = os.environ.get("CDP_ENDPOINT")

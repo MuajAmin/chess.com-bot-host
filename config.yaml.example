@@ -3,8 +3,8 @@
 
 account:
   username: "your_chess_username"
-  password: "your_password"
-  login_mode: "auto"           # "cookie_only" = no credentials needed
+  password: "${CHESS_BOT_PASSWORD}"  # Prefer an environment variable over plaintext.
+  login_mode: "auto"           # "cookie_only" = no username/password needed
                                 # "credentials" = always login with user/pass
                                 # "auto" = try cookies first, fallback to credentials
 
@@ -46,3 +46,5 @@ server:
   headless: true             # false for debugging (shows browser)
   log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
   max_context_games: 3       # recreate browser context every N games (memory leak fix)
+  worker_timeout_seconds: 7200  # kill a stuck game worker after this many seconds
+  browser_no_sandbox: false  # keep false; only true if Chromium sandbox is unavailable

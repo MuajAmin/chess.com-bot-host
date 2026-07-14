@@ -19,7 +19,7 @@ Here is the architectural workflow of the host and game-specific subprocess comm
 | Feature | Description | Implementation Details |
 | :--- | :--- | :--- |
 | **Engine Lifecycle** | On-demand allocation | Lc0 is initialized at game start and terminated instantly upon game completion. |
-| **Memory Isolation** | CDP subprocess structure | Game operations run inside a subprocess. Prevents Chromium and engine memory fragmentation. |
+| **Memory Isolation** | CDP subprocess structure | Game operations run inside a subprocess through a localhost Chrome DevTools endpoint. Prevents engine memory fragmentation. |
 | **Humanized Delays** | Clock-aware timing models | Delay timings dynamically scale with time control type, remaining time ratios, and complexity. |
 | **Position Reading** | Multi-layered parsing | Reconstructs boards via move-list SAN replay. Falls back to DOM attributes and JS state variables. |
 | **Session Control** | Cookie state persistence | Persists active browser authentication contexts to bypass repetitive credential verification. |
@@ -46,7 +46,7 @@ The bot is configured using `config.yaml`. Below is a comprehensive overview of 
 ```yaml
 account:
   username: "your_chess_username"
-  password: "your_password"
+  password: "${CHESS_BOT_PASSWORD}"
   login_mode: "auto"           # auto | cookie_only | credentials
 
 challenge:
@@ -82,6 +82,8 @@ server:
   headless: true               # Set to false to watch browser actions
   log_level: "INFO"            # DEBUG | INFO | WARNING | ERROR
   max_context_games: 3         # Recreate browser context every N games
+  worker_timeout_seconds: 7200 # Kill a stuck game worker after this many seconds
+  browser_no_sandbox: false    # Keep false unless Chromium sandbox is unavailable
 ```
 
 ### Key Parameter Details
@@ -89,9 +91,11 @@ server:
 | Section | Parameter | Default | Description |
 | :--- | :--- | :--- | :--- |
 | **account** | `login_mode` | `auto` | `cookie_only` bypasses credential entry. `credentials` skips cookie checks. `auto` tries cookies first, then credentials. |
-| **engine** | `type` | `auto` | `auto` checks weights filename for "maia" to use `nodes=1` policy optimization automatically. |
+| **engine** | `type` | `auto` | `maia` forces policy-only `nodes=1`; `lc0` forces time-based search; `auto` checks the weights filename for "maia". |
 | **humanizer** | `rating_mimic` | `1800` | Adjusts blunder selection criteria and search depth constraints to match target play strength. |
 | **server** | `max_context_games`| `3` | Periodically refreshes the browser window to flush cached assets and prevent Chromium memory growth. |
+| **server** | `worker_timeout_seconds` | `7200` | Prevents a stuck worker subprocess from blocking the main listener forever. |
+| **server** | `browser_no_sandbox` | `false` | Enables Chromium `--no-sandbox` only when explicitly required. Do not use it while running as root. |
 
 ---
 
@@ -119,6 +123,7 @@ cp config.yaml.example config.yaml
 ```
 
 Modify the parameters in `config.yaml` to match your account and engine installation pathways.
+For secrets, prefer environment variables such as `${CHESS_BOT_PASSWORD}` and keep `config.yaml` and `session_cookies.json` readable only by the bot user.
 
 ### 3. Run
 
@@ -134,6 +139,8 @@ python -m bot.main
 
 ### VPS Deployment (Running in the Background)
 To run the bot persistently on a Linux server, it is recommended to use `systemd` or `screen`:
+
+Run the service as a dedicated non-root user. The included `setup_vps.sh` creates a `bot` service user, applies a restrictive umask, and avoids Chromium `--no-sandbox` by default.
 
 ```bash
 # Running in screen
