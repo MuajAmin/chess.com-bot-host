@@ -90,6 +90,23 @@ class SessionManager:
             raise RuntimeError("Session not initialized. Call login() first.")
         return self._page
 
+    @property
+    def ws_endpoint(self) -> str:
+        """
+        Get the browser's WebSocket endpoint for CDP sharing.
+
+        Used to pass the CDP connection URL to subprocess workers
+        via the CDP_ENDPOINT environment variable.
+        """
+        if self._browser is None:
+            raise RuntimeError("Browser not started. Call login() first.")
+        if self._ws_endpoint:
+            return self._ws_endpoint
+        raise RuntimeError(
+            "WebSocket endpoint not available. "
+            "Browser may have been launched without remote debugging."
+        )
+
     async def start_browser(self):
         """Launch Playwright browser with stealth configuration."""
         logger.info("Launching browser (headless=%s)...", self.config.headless)

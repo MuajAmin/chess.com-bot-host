@@ -10,7 +10,6 @@ Features:
 - Game phase awareness (opening theory = fast, middlegame = slow)
 """
 
-import math
 import random
 import logging
 import asyncio

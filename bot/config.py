@@ -15,13 +15,14 @@ DEFAULTS = {
     "account": {
         "username": "",
         "password": "",
+        "login_mode": "auto",  # cookie_only | credentials | auto
     },
     "challenge": {
         "mode": "whitelist",
         "allowed_users": [],
     },
     "engine": {
-        "type": "lc0",
+        "type": "auto",  # maia | lc0 | auto (auto-detect from weights filename)
         "path": "/usr/local/bin/lc0",
         "weights": "",
         "backend": "blas",
@@ -37,12 +38,16 @@ DEFAULTS = {
         "premove_chance": 0.05,
         "rating_mimic": 1800,
     },
+    "notifications": {
+        "webhook_url": "",  # Telegram/Discord webhook URL (empty = disabled)
+    },
     "server": {
         "check_interval": 12,
         "max_games_per_day": 5,
         "cookie_file": "session_cookies.json",
         "headless": True,
         "log_level": "INFO",
+        "max_context_games": 3,  # Recreate browser context every N games
     },
 }
 
@@ -86,10 +91,23 @@ class Config:
 
         if not self.username:
             errors.append("account.username is required")
-        if not self.password:
-            errors.append("account.password is required")
+
+        # Password only required when login_mode is not cookie_only
+        if self.login_mode != "cookie_only" and not self.password:
+            errors.append("account.password is required (login_mode is not 'cookie_only')")
+
+        if self.login_mode not in ("cookie_only", "credentials", "auto"):
+            errors.append(
+                f"account.login_mode must be 'cookie_only', 'credentials', or 'auto', "
+                f"got: {self.login_mode}"
+            )
+
         if not self.engine_weights:
             errors.append("engine.weights path is required")
+        if self.engine_type not in ("lc0", "maia", "auto"):
+            errors.append(
+                f"engine.type must be 'lc0', 'maia', or 'auto', got: {self.engine_type}"
+            )
         if self.challenge_mode not in ("whitelist", "open"):
             errors.append(f"challenge.mode must be 'whitelist' or 'open', got: {self.challenge_mode}")
         if self.humanizer_delay_min > self.humanizer_delay_max:
@@ -124,6 +142,10 @@ class Config:
     @property
     def password(self):
         return self._data["account"]["password"]
+
+    @property
+    def login_mode(self):
+        return self._data["account"].get("login_mode", "auto")
 
     # --- Challenge ---
     @property
@@ -208,6 +230,15 @@ class Config:
     @property
     def log_level(self):
         return self._data["server"]["log_level"]
+
+    @property
+    def max_context_games(self):
+        return self._data["server"].get("max_context_games", 3)
+
+    # --- Notifications ---
+    @property
+    def webhook_url(self):
+        return self._data.get("notifications", {}).get("webhook_url", "")
 
     def __repr__(self):
         return (
