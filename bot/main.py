@@ -173,7 +173,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
             await asyncio.sleep(2)
 
 
-def play_game_subprocess(session, config):
+async def play_game_subprocess(ws_endpoint, config):
     """
     Spawn game as a subprocess for memory isolation.
 
@@ -184,27 +184,49 @@ def play_game_subprocess(session, config):
     Returns:
         subprocess return code (0 = success)
     """
-    try:
-        ws_endpoint = session.ws_endpoint
-    except RuntimeError:
-        logger.warning("CDP endpoint unavailable — cannot use subprocess mode.")
+    if not ws_endpoint:
+        logger.warning("CDP endpoint unavailable; cannot use subprocess mode.")
         return None  # Signal to use in-process fallback
 
     env = os.environ.copy()
     env["CDP_ENDPOINT"] = ws_endpoint
     env["BOT_CONFIG"] = config.config_path
+    timeout = config.worker_timeout_seconds
 
     logger.info("Spawning game worker subprocess...")
     logger.info("  CDP: %s", ws_endpoint[:60] + "...")
+    logger.info("  Timeout: %ss", timeout)
 
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "bot.game_worker"],
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "bot.game_worker",
         env=env,
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
 
-    # Wait for subprocess to finish (blocks this coroutine)
-    returncode = proc.wait()
+    try:
+        returncode = await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error(
+            "Game worker subprocess timed out after %ss (PID=%d). Terminating.",
+            timeout, proc.pid,
+        )
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.error("Worker did not terminate cleanly. Killing PID=%d.", proc.pid)
+            proc.kill()
+            await proc.wait()
+        return WORKER_TIMEOUT_RETURN_CODE
+    except asyncio.CancelledError:
+        logger.warning("Subprocess wait cancelled. Terminating worker PID=%d.", proc.pid)
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        raise
 
     logger.info(
         "Game worker subprocess exited (code=%d, PID=%d). RAM freed.",
@@ -289,20 +311,26 @@ async def main():
 
             if challenge_accepted:
                 logger.info("Challenge accepted! Initializing game...")
+                game_tracker.start_game()
 
                 if subprocess_available:
                     # --- SUBPROCESS MODE (preferred) ---
                     # Spawn game in isolated subprocess — all RAM freed on exit
-                    await notifier.game_started(
-                        "UNKNOWN",  # Color detected inside subprocess
-                        "challenger",
-                    )
-
                     # Run subprocess (blocking — main waits for game to finish)
-                    loop = asyncio.get_event_loop()
-                    returncode = await loop.run_in_executor(
-                        None, play_game_subprocess, session, config,
-                    )
+                    returncode = None
+                    try:
+                        ws_endpoint = session.ws_endpoint
+                    except RuntimeError:
+                        ws_endpoint = None
+                        subprocess_available = False
+                        logger.warning("Subprocess mode unavailable. Falling back to in-process.")
+
+                    if subprocess_available:
+                        await notifier.game_started(
+                            "UNKNOWN",  # Color detected inside subprocess
+                            "challenger",
+                        )
+                        returncode = await play_game_subprocess(ws_endpoint, config)
 
                     if returncode is None:
                         # CDP endpoint failed — fall through to in-process
