@@ -1,0 +1,38 @@
+# Chess.com Bot Configuration
+# Copy this file to config.yaml and fill in your values
+
+account:
+  username: "your_chess_username"
+  password: "your_password"
+
+challenge:
+  mode: "whitelist"          # "whitelist" = only allowed users, "open" = accept all
+  allowed_users:
+    - "friend1"
+    - "friend2"
+
+engine:
+  type: "lc0"
+  path: "/usr/local/bin/lc0"
+  weights: "/home/bot/weights/maia-1900.pb.gz"
+  backend: "blas"
+  threads: 1
+  nn_cache_size: 200000
+  time_per_move: 1.5         # seconds — only used for non-Maia weights
+  # Maia weights auto-detected: uses nodes=1 (instant, zero CPU spike)
+
+humanizer:
+  enabled: true
+  delay_min: 0.3             # minimum delay before move (seconds)
+  delay_max: 1.5             # maximum delay before move (seconds)
+  blunder_chance: 0.08       # 8% chance of suboptimal move
+  premove_chance: 0.05       # 5% chance of near-instant move
+  rating_mimic: 1800         # target rating to mimic
+
+server:
+  check_interval: 12         # seconds between challenge checks
+  max_games_per_day: 5       # daily game limit to avoid suspicion
+  cookie_file: "session_cookies.json"
+  headless: true             # false for debugging (shows browser)
+  log_level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+  max_context_games: 3       # recreate browser context every N games (memory leak fix)

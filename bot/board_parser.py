@@ -1,0 +1,880 @@
+"""
+Board parser for chess.com.
+Reads the board state using multiple strategies for robustness:
+1. Move list replay (MOST RELIABLE — reconstructs from SAN move history)
+2. Internal JS game state (stable but can break on bundle updates)
+3. data-square attributes on DOM elements
+4. CSS class fallback (least reliable but widest compatibility)
+
+Castling rights, en-passant, and move counters are ALL correct when
+using Strategy 1 (move replay). Other strategies fall back to inferring
+from piece positions.
+
+NOTE: React fiber tree walk is deliberately NOT used here — chess.com's
+minified bundle randomizes fiber property names on every deploy.
+"""
+
+import logging
+import re
+import chess
+
+logger = logging.getLogger(__name__)
+
+# Chess.com piece class mapping → python-chess FEN symbols
+PIECE_CLASS_MAP = {
+    "wp": "P", "wn": "N", "wb": "B", "wr": "R", "wq": "Q", "wk": "K",
+    "bp": "p", "bn": "n", "bb": "b", "br": "r", "bq": "q", "bk": "k",
+}
+
+# Reverse mapping for data-piece attributes (lowercase single char)
+PIECE_CHAR_MAP = {
+    "P": "P", "N": "N", "B": "B", "R": "R", "Q": "Q", "K": "K",
+    "p": "p", "n": "n", "b": "b", "r": "r", "q": "q", "k": "k",
+}
+
+# SAN cleaning regex — strips move numbers, annotations, NAGs
+_SAN_CLEAN_RE = re.compile(r'[?!+#]+$')
+
+
+class BoardParser:
+    """
+    Parses chess.com board to extract the current position as FEN.
+
+    Uses a layered strategy (priority order):
+    1. Move list replay — reads SAN moves from DOM, replays on python-chess Board
+       → gives PERFECT FEN including castling, en-passant, halfmove clock
+    2. Internal JS game state — reads from chess.com's wc-chess-board component
+    3. data-square/data-piece attributes on DOM elements
+    4. CSS class parsing (square-XY pattern) — last resort
+
+    Strategy 1 is the only one that gets castling rights and en-passant correct.
+    Strategies 2-4 can only determine piece placement (position part of FEN).
+    """
+
+    def __init__(self, page):
+        self.page = page
+        self._our_color = None
+        self._last_fen = None
+        self._last_board = None  # Cache full Board object from move replay
+        self._move_count = 0
+        self._strategy_used = None
+
+    @property
+    def our_color(self):
+        return self._our_color
+
+    @property
+    def is_white(self):
+        return self._our_color == chess.WHITE
+
+    async def detect_our_color(self):
+        """Detect which color we are playing."""
+        try:
+            # Strategy 1: Check board component's flipped attribute
+            flipped = await self.page.evaluate("""
+                () => {
+                    const board = document.querySelector('wc-chess-board');
+                    if (board) {
+                        // Check 'flipped' attribute (boolean attribute)
+                        if (board.hasAttribute('flipped')) return true;
+                        // Check flipped property
+                        if (board.flipped === true) return true;
+                        // Check class
+                        if (board.className && board.className.includes('flipped')) return true;
+                    }
+                    // Fallback: check for flipped class on any board container
+                    const containers = document.querySelectorAll('.board, .board-layout-main');
+                    for (const c of containers) {
+                        if (c.className.includes('flipped')) return true;
+                    }
+                    return false;
+                }
+            """)
+
+            if flipped:
+                self._our_color = chess.BLACK
+                logger.info("Detected: Playing as BLACK")
+            else:
+                self._our_color = chess.WHITE
+                logger.info("Detected: Playing as WHITE")
+
+            return self._our_color
+
+        except Exception as e:
+            logger.warning("Color detection failed, defaulting to WHITE: %s", e)
+            self._our_color = chess.WHITE
+            return chess.WHITE
+
+    async def get_board_fen(self):
+        """
+        Parse the board and return FULL FEN string (position + turn +
+        castling + en-passant + halfmove + fullmove).
+
+        Tries multiple strategies in order of reliability.
+        """
+        # Strategy 1: Move list replay (MOST RELIABLE — perfect FEN)
+        board = await self._parse_from_move_replay()
+        if board is not None:
+            self._strategy_used = "move_replay"
+            self._last_board = board
+            self._last_fen = board.fen()
+            return board.fen()
+
+        # Strategy 2: Internal JS game state
+        fen = await self._parse_from_js_state()
+        if fen:
+            self._strategy_used = "js_state"
+            self._last_fen = fen
+            return fen
+
+        # Strategy 3: data-square attributes on DOM
+        fen = await self._parse_from_data_attributes()
+        if fen:
+            self._strategy_used = "data_attrs"
+            self._last_fen = fen
+            return fen
+
+        # Strategy 4: CSS class fallback (square-XY pattern)
+        fen = await self._parse_from_css_classes()
+        if fen:
+            self._strategy_used = "css_classes"
+            self._last_fen = fen
+            return fen
+
+        logger.warning("All board parsing strategies failed!")
+        return self._last_fen
+
+    async def _parse_from_move_replay(self):
+        """
+        Strategy 1 (PRIMARY): Read SAN moves from chess.com's move list,
+        replay them on a python-chess Board to reconstruct the exact game state.
+
+        This is the MOST RELIABLE strategy because:
+        - Move list DOM uses semantic elements that rarely change
+        - Replaying gives PERFECT castling rights, en-passant, halfmove clock
+        - Class-independent — doesn't depend on obfuscated CSS class names
+        """
+        try:
+            # Extract SAN moves from chess.com's move list
+            move_data = await self.page.evaluate("""
+                () => {
+                    const moves = [];
+
+                    // Method A: data-ply attribute elements (most reliable)
+                    const plyNodes = document.querySelectorAll('[data-ply]');
+                    if (plyNodes.length > 0) {
+                        // Sort by ply number for correct order
+                        const sorted = Array.from(plyNodes).sort(
+                            (a, b) => parseInt(a.getAttribute('data-ply')) -
+                                      parseInt(b.getAttribute('data-ply'))
+                        );
+                        for (const node of sorted) {
+                            const text = node.textContent.trim();
+                            if (text && text !== '...' && !/^\\d+\\.$/.test(text)) {
+                                moves.push(text);
+                            }
+                        }
+                        if (moves.length > 0) return { source: 'data-ply', moves };
+                    }
+
+                    // Method B: move-text / move-node class elements
+                    const moveNodes = document.querySelectorAll(
+                        '.move-text-component, .move-node, .move-text'
+                    );
+                    for (const node of moveNodes) {
+                        const text = node.textContent.trim();
+                        // Filter out move numbers (e.g., "1.", "2.")
+                        if (text && !/^\\d+\\.?$/.test(text) && text !== '...') {
+                            moves.push(text);
+                        }
+                    }
+                    if (moves.length > 0) return { source: 'move-class', moves };
+
+                    // Method C: Vertical move list (alternative layout)
+                    const vertNodes = document.querySelectorAll(
+                        '.vertical-move-list .move, [class*="move-list"] [class*="move"]'
+                    );
+                    for (const node of vertNodes) {
+                        // Each move row might contain both white and black moves
+                        const moveTexts = node.querySelectorAll(
+                            '[class*="white"], [class*="black"], .move-text'
+                        );
+                        for (const mt of moveTexts) {
+                            const text = mt.textContent.trim();
+                            if (text && !/^\\d+\\.?$/.test(text)) {
+                                moves.push(text);
+                            }
+                        }
+                    }
+                    if (moves.length > 0) return { source: 'vertical', moves };
+
+                    return null;
+                }
+            """)
+
+            if not move_data or not move_data.get("moves"):
+                logger.debug("Move list replay: no moves found in DOM")
+                return None
+
+            raw_moves = move_data["moves"]
+            source = move_data["source"]
+            logger.debug(
+                "Move list replay: found %d moves (source: %s)",
+                len(raw_moves), source,
+            )
+
+            # Replay moves on a fresh board
+            board = chess.Board()
+            for i, raw_san in enumerate(raw_moves):
+                san = self._clean_san(raw_san)
+                if not san:
+                    continue
+                try:
+                    board.push_san(san)
+                except (chess.IllegalMoveError, chess.InvalidMoveError,
+                        chess.AmbiguousMoveError) as e:
+                    logger.warning(
+                        "Move replay: invalid move '%s' (cleaned: '%s') at index %d: %s",
+                        raw_san, san, i, e,
+                    )
+                    # If we fail mid-replay, return what we have so far
+                    # (better than nothing — at least castling rights are partially correct)
+                    if board.move_stack:
+                        logger.info(
+                            "Move replay: partial replay (%d/%d moves applied)",
+                            len(board.move_stack), len(raw_moves),
+                        )
+                        return board
+                    return None
+
+            logger.debug(
+                "Move replay: full board reconstructed (%d moves, FEN: %s)",
+                len(board.move_stack), board.fen()[:50],
+            )
+            return board
+
+        except Exception as e:
+            logger.debug("Move list replay failed: %s", e)
+            return None
+
+    def _clean_san(self, raw):
+        """
+        Clean a raw SAN string from chess.com DOM.
+
+        Handles:
+        - Move numbers: "1." "2." "12."
+        - Annotations: "!!" "??" "!?" "?!"
+        - Check/checkmate: "+" "#"
+        - Ellipsis: "..." (black's move indicator)
+        - Whitespace and newlines
+        - NAG symbols
+        """
+        if not raw:
+            return None
+
+        san = raw.strip()
+
+        # Skip pure move numbers ("1.", "2.", "12.")
+        if re.match(r'^\d+\.+$', san):
+            return None
+
+        # Skip ellipsis (used to indicate black's move)
+        if san in ('...', '…', '..'):
+            return None
+
+        # Remove leading move number if embedded ("1.e4" → "e4", "12.Nf3" → "Nf3")
+        san = re.sub(r'^\d+\.+\s*', '', san)
+
+        # Remove trailing annotations but KEEP check/checkmate markers
+        # "Nf3!!" → "Nf3", "Qxf7#" stays, "e4+" stays
+        san = re.sub(r'[?!]+$', '', san)
+
+        # Remove any remaining whitespace
+        san = san.strip()
+
+        if not san:
+            return None
+
+        return san
+
+    async def _parse_from_js_state(self):
+        """
+        Strategy 2: Read position from chess.com's internal JS game state.
+        Reads the data model directly — survives most DOM changes.
+
+        NOTE: No fiber tree walk — chess.com's minified bundle randomizes
+        fiber property names. Only uses documented/stable API surfaces.
+        """
+        try:
+            fen = await self.page.evaluate("""
+                () => {
+                    // Method A: wc-chess-board component's game property
+                    const board = document.querySelector('wc-chess-board');
+                    if (board) {
+                        // Try the component's internal game/position property
+                        if (board.game && board.game.getFEN) {
+                            return board.game.getFEN();
+                        }
+                        if (board.game && board.game.fen) {
+                            return typeof board.game.fen === 'function'
+                                ? board.game.fen()
+                                : board.game.fen;
+                        }
+                        // Try position property
+                        if (board.position) {
+                            return typeof board.position === 'function'
+                                ? board.position()
+                                : board.position;
+                        }
+                    }
+
+                    // Method B: Global game objects chess.com sometimes exposes
+                    if (typeof window.game !== 'undefined' && window.game) {
+                        if (window.game.getFEN) return window.game.getFEN();
+                        if (window.game.fen) return window.game.fen();
+                    }
+
+                    // Method C: Check for LiveChess or similar global objects
+                    if (typeof window.LiveChess !== 'undefined') {
+                        try {
+                            const lc = window.LiveChess;
+                            if (lc.currentGame && lc.currentGame.getFEN) {
+                                return lc.currentGame.getFEN();
+                            }
+                        } catch(e) {}
+                    }
+
+                    return null;
+                }
+            """)
+
+            if fen and "/" in fen:
+                logger.debug("JS state FEN: %s", fen[:60])
+                # If it's a full FEN (with turn, castling etc.), return as-is
+                if " " in fen:
+                    return fen
+                # Position-only FEN — need to infer turn
+                turn = await self._detect_turn()
+                # Without move replay, we can't know castling rights precisely
+                # Use conservative "all castling available" as fallback
+                return f"{fen} {'w' if turn == chess.WHITE else 'b'} KQkq - 0 1"
+
+            return None
+
+        except Exception as e:
+            logger.debug("JS state parsing failed: %s", e)
+            return None
+
+    async def _parse_from_data_attributes(self):
+        """
+        Strategy 3: Read pieces from data-square and data-piece attributes.
+        More stable than CSS classes since data attributes are semantic.
+        """
+        try:
+            pieces = await self.page.evaluate("""
+                () => {
+                    const result = [];
+
+                    // Try data-square attribute on piece elements
+                    const pieceEls = document.querySelectorAll('[data-square]');
+                    for (const el of pieceEls) {
+                        const square = el.getAttribute('data-square');
+                        const piece = el.getAttribute('data-piece');
+                        if (square && piece) {
+                            result.push({ square, piece, source: 'data-attr' });
+                        }
+                    }
+
+                    if (result.length > 0) return result;
+
+                    // Try pieces inside squares with data-square
+                    const squares = document.querySelectorAll('[data-square]');
+                    for (const sq of squares) {
+                        const squareName = sq.getAttribute('data-square');
+                        const pieceEl = sq.querySelector('[data-piece], .piece');
+                        if (pieceEl) {
+                            const piece = pieceEl.getAttribute('data-piece') ||
+                                          pieceEl.getAttribute('data-type');
+                            if (squareName && piece) {
+                                result.push({ square: squareName, piece, source: 'nested' });
+                            }
+                        }
+                    }
+
+                    return result;
+                }
+            """)
+
+            if not pieces or len(pieces) < 2:
+                return None
+
+            position = self._build_fen_from_named_squares(pieces)
+            if position:
+                turn = await self._detect_turn()
+                castling = self._infer_castling_from_position(position)
+                return f"{position} {'w' if turn == chess.WHITE else 'b'} {castling} - 0 1"
+            return None
+
+        except Exception as e:
+            logger.debug("Data attribute parsing failed: %s", e)
+            return None
+
+    async def _parse_from_css_classes(self):
+        """
+        Strategy 4: Read pieces from CSS class names (square-XY pattern).
+        Least reliable but most commonly available.
+        """
+        try:
+            pieces = await self.page.evaluate("""
+                () => {
+                    const result = [];
+                    const els = document.querySelectorAll('.piece');
+
+                    for (const el of els) {
+                        const classes = el.className.split(/\\s+/);
+                        let pieceType = null;
+                        let squareCoords = null;
+
+                        for (const cls of classes) {
+                            // Piece type: wp, wn, wb, wr, wq, wk, bp, bn, bb, br, bq, bk
+                            if (/^[wb][pnbrqk]$/.test(cls)) {
+                                pieceType = cls;
+                            }
+                            // Square: square-XY (1-indexed file, rank)
+                            const sqMatch = cls.match(/^square-(\\d)(\\d)$/);
+                            if (sqMatch) {
+                                squareCoords = { file: parseInt(sqMatch[1]), rank: parseInt(sqMatch[2]) };
+                            }
+                            // Alternative: square-XY with 2+ digits (e.g., square-108 for h8 on 10x10?)
+                            // Standard chess is always single digits 1-8
+                        }
+
+                        if (pieceType && squareCoords) {
+                            result.push({ piece: pieceType, coords: squareCoords });
+                        }
+                    }
+                    return result;
+                }
+            """)
+
+            if not pieces or len(pieces) < 2:
+                return None
+
+            position = self._build_fen_from_coords(pieces)
+            if position:
+                turn = await self._detect_turn()
+                castling = self._infer_castling_from_position(position)
+                return f"{position} {'w' if turn == chess.WHITE else 'b'} {castling} - 0 1"
+            return None
+
+        except Exception as e:
+            logger.debug("CSS class parsing failed: %s", e)
+            return None
+
+    def _infer_castling_from_position(self, position_fen):
+        """
+        Infer castling rights from piece positions.
+        If king/rook are NOT on starting squares, that castling option is removed.
+        This is a best-effort heuristic — only move replay gives perfect rights.
+        """
+        # Parse position to find king and rook locations
+        rows = position_fen.split("/")
+        if len(rows) != 8:
+            return "KQkq"  # fallback
+
+        # Expand FEN rows to 8-char strings
+        def expand_row(row):
+            expanded = ""
+            for ch in row:
+                if ch.isdigit():
+                    expanded += "." * int(ch)
+                else:
+                    expanded += ch
+            return expanded
+
+        expanded = [expand_row(r) for r in rows]
+        # rows[0] = rank 8, rows[7] = rank 1
+
+        castling = ""
+
+        # White: King on e1 (row 7, col 4), Rooks on a1 (row 7, col 0) and h1 (row 7, col 7)
+        rank1 = expanded[7] if len(expanded) > 7 else ""
+        if len(rank1) >= 8:
+            if rank1[4] == 'K':  # White king on e1
+                if rank1[7] == 'R':  # White rook on h1
+                    castling += "K"
+                if rank1[0] == 'R':  # White rook on a1
+                    castling += "Q"
+
+        # Black: King on e8 (row 0, col 4), Rooks on a8 (row 0, col 0) and h8 (row 0, col 7)
+        rank8 = expanded[0] if len(expanded) > 0 else ""
+        if len(rank8) >= 8:
+            if rank8[4] == 'k':  # Black king on e8
+                if rank8[7] == 'r':  # Black rook on h8
+                    castling += "k"
+                if rank8[0] == 'r':  # Black rook on a8
+                    castling += "q"
+
+        return castling if castling else "-"
+
+    def _build_fen_from_coords(self, pieces):
+        """Build FEN position from coordinate-based piece data (CSS class strategy)."""
+        board_array = [[None for _ in range(8)] for _ in range(8)]
+
+        for p in pieces:
+            piece_code = p["piece"]
+            coords = p["coords"]
+
+            file_idx = coords["file"] - 1  # 1-8 → 0-7
+            rank_idx = coords["rank"] - 1   # 1-8 → 0-7
+
+            if 0 <= file_idx <= 7 and 0 <= rank_idx <= 7:
+                fen_piece = PIECE_CLASS_MAP.get(piece_code)
+                if fen_piece:
+                    board_array[7 - rank_idx][file_idx] = fen_piece
+
+        return self._array_to_fen(board_array)
+
+    def _build_fen_from_named_squares(self, pieces):
+        """Build FEN position from algebraic square names (data-attribute strategy)."""
+        board_array = [[None for _ in range(8)] for _ in range(8)]
+
+        for p in pieces:
+            square_name = p["square"]  # e.g., "e4"
+            piece_code = p["piece"]     # e.g., "wk" or "K"
+
+            if len(square_name) != 2:
+                continue
+
+            file_char = square_name[0].lower()
+            rank_char = square_name[1]
+
+            if file_char < 'a' or file_char > 'h' or rank_char < '1' or rank_char > '8':
+                continue
+
+            file_idx = ord(file_char) - ord('a')  # 0-7
+            rank_idx = int(rank_char) - 1          # 0-7
+
+            # Map piece code to FEN character
+            fen_piece = PIECE_CLASS_MAP.get(piece_code)
+            if not fen_piece:
+                fen_piece = PIECE_CHAR_MAP.get(piece_code)
+            if fen_piece:
+                board_array[7 - rank_idx][file_idx] = fen_piece
+
+        return self._array_to_fen(board_array)
+
+    def _array_to_fen(self, board_array):
+        """Convert 8x8 board array to FEN position string."""
+        fen_rows = []
+        for row in board_array:
+            fen_row = ""
+            empty_count = 0
+            for cell in row:
+                if cell is None:
+                    empty_count += 1
+                else:
+                    if empty_count > 0:
+                        fen_row += str(empty_count)
+                        empty_count = 0
+                    fen_row += cell
+            if empty_count > 0:
+                fen_row += str(empty_count)
+            fen_rows.append(fen_row)
+
+        fen = "/".join(fen_rows)
+
+        # Sanity check: FEN should have 8 rows
+        if len(fen_rows) != 8:
+            logger.warning("FEN has %d rows instead of 8!", len(fen_rows))
+            return None
+
+        return fen
+
+    async def get_full_board(self):
+        """
+        Get a python-chess Board object representing the current position.
+
+        If move replay was used, returns the replayed board directly
+        (which has correct castling rights, en-passant, etc).
+        Otherwise constructs from FEN string.
+        """
+        # Try move replay first — gives us a perfect Board object
+        board = await self._parse_from_move_replay()
+        if board is not None:
+            self._strategy_used = "move_replay"
+            self._last_board = board
+            self._last_fen = board.fen()
+            return board
+
+        # Fallback to FEN-based parsing
+        fen = await self.get_board_fen()
+        if fen is None:
+            return None
+
+        try:
+            board = chess.Board(fen)
+            return board
+        except Exception as e:
+            logger.error("Failed to create Board from FEN '%s': %s", fen, e)
+            return None
+
+    async def _detect_turn(self):
+        """Detect whose turn it is using multiple methods."""
+        try:
+            # Method 1: Check active clock via JS (most reliable)
+            turn_data = await self.page.evaluate("""
+                () => {
+                    // Check which clock has the 'active' or 'running' indicator
+                    const clocks = document.querySelectorAll(
+                        '[class*="clock"]'
+                    );
+
+                    let bottomActive = false;
+                    let topActive = false;
+
+                    for (const clock of clocks) {
+                        const cls = clock.className || '';
+                        const isActive = cls.includes('active') ||
+                                        cls.includes('running') ||
+                                        cls.includes('player-turn');
+
+                        if (!isActive) continue;
+
+                        // Determine if this clock is top or bottom
+                        const rect = clock.getBoundingClientRect();
+                        const boardEl = document.querySelector('wc-chess-board, .board');
+                        if (boardEl) {
+                            const boardRect = boardEl.getBoundingClientRect();
+                            const boardMid = boardRect.top + boardRect.height / 2;
+                            if (rect.top > boardMid) {
+                                bottomActive = true;
+                            } else {
+                                topActive = true;
+                            }
+                        }
+                    }
+
+                    return { bottomActive, topActive };
+                }
+            """)
+
+            if turn_data:
+                if turn_data.get("bottomActive"):
+                    return self._our_color
+                elif turn_data.get("topActive"):
+                    return chess.BLACK if self._our_color == chess.WHITE else chess.WHITE
+
+            # Method 2: Count moves in the move list
+            move_count = await self.page.evaluate("""
+                () => {
+                    const nodes = document.querySelectorAll(
+                        '[data-ply], .move-text-component, .move-node'
+                    );
+                    return nodes.length;
+                }
+            """)
+
+            if move_count is not None:
+                return chess.WHITE if move_count % 2 == 0 else chess.BLACK
+
+            return chess.WHITE
+
+        except Exception as e:
+            logger.warning("Turn detection failed: %s", e)
+            return chess.WHITE
+
+    async def is_our_turn(self):
+        """Check if it's currently our turn to move."""
+        turn = await self._detect_turn()
+        return turn == self._our_color
+
+    async def get_remaining_time(self):
+        """
+        Read remaining time from chess.com's clock elements.
+
+        Returns:
+            dict with 'our_time' and 'opp_time' in seconds, or None on failure.
+        """
+        try:
+            clock_data = await self.page.evaluate("""
+                () => {
+                    function parseClockText(text) {
+                        if (!text) return null;
+                        text = text.trim();
+
+                        // Format: "M:SS" or "H:MM:SS" or "S.d" (for <10 seconds)
+                        const parts = text.split(':');
+                        if (parts.length === 2) {
+                            // M:SS
+                            const mins = parseInt(parts[0]) || 0;
+                            const secs = parseFloat(parts[1]) || 0;
+                            return mins * 60 + secs;
+                        } else if (parts.length === 3) {
+                            // H:MM:SS
+                            const hrs = parseInt(parts[0]) || 0;
+                            const mins = parseInt(parts[1]) || 0;
+                            const secs = parseFloat(parts[2]) || 0;
+                            return hrs * 3600 + mins * 60 + secs;
+                        } else if (parts.length === 1) {
+                            // Just seconds (possibly with decimal)
+                            return parseFloat(text) || null;
+                        }
+                        return null;
+                    }
+
+                    const clockEls = document.querySelectorAll(
+                        '.clock-component, [class*="clock-time"], .clock-time-monospace'
+                    );
+
+                    const clocks = [];
+                    const boardEl = document.querySelector('wc-chess-board, .board');
+                    const boardRect = boardEl ? boardEl.getBoundingClientRect() : null;
+                    const boardMid = boardRect ? boardRect.top + boardRect.height / 2 : 0;
+
+                    for (const el of clockEls) {
+                        const text = el.textContent;
+                        const seconds = parseClockText(text);
+                        if (seconds === null) continue;
+
+                        const rect = el.getBoundingClientRect();
+                        const isBottom = boardRect ? rect.top > boardMid : false;
+
+                        clocks.push({ seconds, isBottom, text });
+                    }
+
+                    if (clocks.length < 2) return null;
+
+                    // Bottom clock = our clock, Top clock = opponent's clock
+                    const bottom = clocks.find(c => c.isBottom);
+                    const top = clocks.find(c => !c.isBottom);
+
+                    if (bottom && top) {
+                        return { our_time: bottom.seconds, opp_time: top.seconds };
+                    }
+
+                    return null;
+                }
+            """)
+
+            if clock_data:
+                logger.debug(
+                    "Clock: our=%.1fs, opp=%.1fs",
+                    clock_data["our_time"], clock_data["opp_time"],
+                )
+                return clock_data
+
+            return None
+
+        except Exception as e:
+            logger.debug("Clock reading failed: %s", e)
+            return None
+
+    async def detect_time_control(self):
+        """
+        Detect the time control of the current game (base time + increment).
+
+        Returns:
+            dict with 'base_time' (seconds) and 'increment' (seconds), or None.
+        """
+        try:
+            tc_data = await self.page.evaluate("""
+                () => {
+                    // Method 1: Look for time control text in game info
+                    const tcSelectors = [
+                        '[class*="time-control"]',
+                        '[class*="game-time"]',
+                        '.time-selector-component',
+                    ];
+
+                    for (const sel of tcSelectors) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const text = el.textContent.trim();
+                            // Parse "3|0", "5|3", "10|0", "15|10", "3+0", "5+3"
+                            const match = text.match(/(\\d+)\\s*[|+]\\s*(\\d+)/);
+                            if (match) {
+                                return {
+                                    base_time: parseInt(match[1]) * 60,
+                                    increment: parseInt(match[2])
+                                };
+                            }
+                        }
+                    }
+
+                    // Method 2: Infer from initial clock values
+                    const clockEls = document.querySelectorAll(
+                        '.clock-component, [class*="clock-time"]'
+                    );
+                    if (clockEls.length >= 2) {
+                        const times = [];
+                        for (const el of clockEls) {
+                            const text = el.textContent.trim();
+                            const parts = text.split(':');
+                            if (parts.length === 2) {
+                                const mins = parseInt(parts[0]) || 0;
+                                const secs = parseInt(parts[1]) || 0;
+                                times.push(mins * 60 + secs);
+                            }
+                        }
+                        if (times.length >= 2) {
+                            const maxTime = Math.max(...times);
+                            // Can't determine increment from clocks alone
+                            return { base_time: maxTime, increment: 0 };
+                        }
+                    }
+
+                    return null;
+                }
+            """)
+
+            if tc_data:
+                logger.info(
+                    "Time control detected: %d+%d",
+                    tc_data["base_time"] // 60, tc_data["increment"],
+                )
+            return tc_data
+
+        except Exception as e:
+            logger.debug("Time control detection failed: %s", e)
+            return None
+
+    async def get_last_opponent_move(self):
+        """Get the last move played by reading highlighted squares."""
+        try:
+            highlights = await self.page.evaluate("""
+                () => {
+                    const result = [];
+                    // Try highlight elements
+                    const els = document.querySelectorAll(
+                        '.highlight, [class*="highlight"]'
+                    );
+                    for (const el of els) {
+                        // Check data-square attribute first
+                        const sq = el.getAttribute('data-square');
+                        if (sq) {
+                            result.push(sq);
+                            continue;
+                        }
+                        // Fallback to class parsing
+                        const classes = el.className.split(/\\s+/);
+                        for (const cls of classes) {
+                            const match = cls.match(/^square-(\\d)(\\d)$/);
+                            if (match) {
+                                const file = String.fromCharCode(96 + parseInt(match[1]));
+                                const rank = match[2];
+                                result.push(file + rank);
+                            }
+                        }
+                    }
+                    return result;
+                }
+            """)
+
+            if highlights and len(highlights) >= 2:
+                return highlights
+            return None
+
+        except Exception as e:
+            logger.warning("Could not detect last move: %s", e)
+            return None

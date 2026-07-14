@@ -1,0 +1,11 @@
+config.yaml
+session_cookies.json
+__pycache__/
+*.pyc
+*.pyo
+logs/
+*.log
+.env
+weights/
+lc0
+lc0.exe
