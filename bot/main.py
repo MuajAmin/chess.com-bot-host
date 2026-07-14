@@ -337,8 +337,15 @@ async def main():
                         subprocess_available = False
                         logger.warning("Subprocess mode failed. Falling back to in-process.")
                     else:
-                        result = "completed" if returncode == 0 else f"error (code={returncode})"
-                        await notifier.game_ended(result)
+                        if returncode == 0:
+                            result = "completed"
+                        elif returncode == WORKER_TIMEOUT_RETURN_CODE:
+                            result = "timeout"
+                        else:
+                            result = f"error (code={returncode})"
+
+                        duration = game_tracker.end_game(result)
+                        await notifier.game_ended(result, duration_secs=duration)
 
                         # Force Python GC (subprocess already freed its own RAM)
                         gc.collect()
@@ -349,6 +356,11 @@ async def main():
                     if not await engine.start():
                         logger.error("Failed to start engine. Skipping game.")
                         await notifier.error("Engine start failed. Skipping game.")
+                        duration = game_tracker.end_game("engine_start_failed")
+                        await notifier.game_ended(
+                            "engine_start_failed",
+                            duration_secs=duration,
+                        )
                         continue
 
                     board_parser = BoardParser(session.page)
@@ -387,7 +399,7 @@ async def main():
                 # Update page references after context recreation
                 page = session.page
                 challenge_listener = ChallengeListener(config, page)
-                game_tracker = GameTracker(config, page)
+                game_tracker.page = page
 
                 logger.info(
                     "Cleanup complete. Games: %d/%d, RAM freed.",
