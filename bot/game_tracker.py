@@ -40,6 +40,12 @@ class GameTracker:
 
     def start_game(self):
         """Mark a new game as started."""
+        if self._game_active:
+            logger.debug("Game already active; daily counter not incremented again.")
+            return
+
+        # Touch the property first so the counter resets when the date changes.
+        _ = self.games_today
         self._game_active = True
         self._game_start_time = datetime.now()
         self._games_today += 1
@@ -64,6 +70,7 @@ class GameTracker:
             self._games_today,
             self.config.max_games_per_day,
         )
+        return duration
 
     async def detect_game_end(self):
         """
