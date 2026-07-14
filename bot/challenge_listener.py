@@ -42,7 +42,14 @@ class ChallengeListener:
             # Check if we should accept this challenge
             challenger_name = challenge.get("username", "unknown")
             if not self._should_accept(challenger_name):
-                logger.info("Declined challenge from %s (not in whitelist)", challenger_name)
+                declined = await self.decline_challenge(challenge)
+                if declined:
+                    logger.info("Declined challenge from %s (not in whitelist)", challenger_name)
+                else:
+                    logger.warning(
+                        "Challenge from %s is not in whitelist, but no decline control was found.",
+                        challenger_name,
+                    )
                 return False
 
             # Accept the challenge
@@ -199,24 +206,20 @@ class ChallengeListener:
             if challenge_el:
                 for selector in accept_selectors:
                     btn = challenge_el.locator(selector)
-                    if await btn.count() > 0:
-                        await btn.first.click()
-                        logger.info("Accepted via button: %s (in challenge)", selector)
-                        return True
-
-            # Fallback: try page-wide accept buttons
-            for selector in accept_selectors:
-                btn = self.page.locator(selector)
-                if await btn.count() > 0:
-                    await btn.first.click()
-                    logger.info("Accepted via button: %s (page-wide)", selector)
-                    return True
+                    for index in range(await btn.count()):
+                        candidate = btn.nth(index)
+                        if await candidate.is_visible():
+                            await candidate.click()
+                            logger.info("Accepted via button: %s (in challenge)", selector)
+                            return True
 
             # Last resort: click the challenge element itself
             if challenge_el:
-                await challenge_el.click()
-                logger.info("Clicked challenge element directly")
-                return True
+                text = (await challenge_el.text_content() or "").lower()
+                if "accept" in text or "play" in text:
+                    await challenge_el.click()
+                    logger.info("Clicked challenge element directly")
+                    return True
 
             logger.warning("Could not find accept button for challenge")
             return False
@@ -239,10 +242,12 @@ class ChallengeListener:
             if challenge_el:
                 for selector in decline_selectors:
                     btn = challenge_el.locator(selector)
-                    if await btn.count() > 0:
-                        await btn.first.click()
-                        logger.info("Declined challenge")
-                        return True
+                    for index in range(await btn.count()):
+                        candidate = btn.nth(index)
+                        if await candidate.is_visible():
+                            await candidate.click()
+                            logger.info("Declined challenge")
+                            return True
 
             return False
 

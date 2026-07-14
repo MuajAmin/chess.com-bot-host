@@ -12,7 +12,10 @@ Anti-detection features:
 
 import json
 import os
+import asyncio
 import logging
+import socket
+import urllib.request
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
@@ -81,7 +84,8 @@ class SessionManager:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._context_age = 0  # Track how many games this context has served
-        self._ws_endpoint = None  # CDP WebSocket endpoint for subprocess sharing
+        self._ws_endpoint = None  # CDP endpoint for subprocess sharing
+        self._cdp_port = None
         self.MAX_CONTEXT_AGE = config.max_context_games if hasattr(config, 'max_context_games') else 3
 
     @property
@@ -94,7 +98,7 @@ class SessionManager:
     @property
     def ws_endpoint(self) -> str:
         """
-        Get the browser's WebSocket endpoint for CDP sharing.
+        Get the browser's CDP endpoint for subprocess sharing.
 
         Used to pass the CDP connection URL to subprocess workers
         via the CDP_ENDPOINT environment variable.
@@ -108,47 +112,93 @@ class SessionManager:
             "Browser may have been launched without remote debugging."
         )
 
+    @staticmethod
+    def _find_free_local_port():
+        """Reserve a currently free localhost TCP port for Chrome CDP."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    @staticmethod
+    def _fetch_cdp_version(version_url):
+        with urllib.request.urlopen(version_url, timeout=1) as response:
+            payload = response.read().decode("utf-8")
+        return json.loads(payload)
+
+    async def _wait_for_cdp_endpoint(self, endpoint, timeout=5):
+        """Wait until Chrome exposes its CDP /json/version endpoint."""
+        version_url = f"{endpoint}/json/version"
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                await asyncio.to_thread(self._fetch_cdp_version, version_url)
+                return True
+            except Exception:
+                await asyncio.sleep(0.1)
+        return False
+
+    @staticmethod
+    def _running_as_root():
+        return hasattr(os, "geteuid") and os.geteuid() == 0
+
+    @staticmethod
+    def _restrict_file_permissions(path):
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.chmod(path, 0o600)
+        except OSError as e:
+            logger.debug("Could not restrict permissions on %s: %s", path, e)
+
     async def start_browser(self):
         """Launch Playwright browser with stealth configuration."""
         logger.info("Launching browser (headless=%s)...", self.config.headless)
         self._playwright = await async_playwright().start()
 
+        if self._running_as_root() and not self.config.browser_no_sandbox:
+            await self._playwright.stop()
+            self._playwright = None
+            raise RuntimeError(
+                "Refusing to launch Chromium as root with the sandbox enabled. "
+                "Run the bot as a non-root user, or explicitly set "
+                "server.browser_no_sandbox=true if you accept that risk."
+            )
+
+        self._cdp_port = self._find_free_local_port()
+        self._ws_endpoint = f"http://127.0.0.1:{self._cdp_port}"
+        chromium_args = [
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--disable-translate",
+            "--no-first-run",
+            "--disable-blink-features=AutomationControlled",  # Hide automation
+            "--disable-infobars",
+            "--single-process",              # Reduce memory
+            "--disable-features=site-per-process",  # Reduce memory
+            "--js-flags=--max-old-space-size=256",   # Limit V8 heap
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={self._cdp_port}",
+        ]
+        if self.config.browser_no_sandbox:
+            logger.warning(
+                "Chromium sandbox disabled by config. Do not run this as root."
+            )
+            chromium_args.append("--no-sandbox")
+
         self._browser = await self._playwright.chromium.launch(
             headless=self.config.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--disable-translate",
-                "--no-first-run",
-                "--disable-blink-features=AutomationControlled",  # Hide automation
-                "--disable-infobars",
-                "--single-process",              # Reduce memory
-                "--disable-features=site-per-process",  # Reduce memory
-                "--js-flags=--max-old-space-size=256",   # Limit V8 heap
-                "--remote-debugging-port=0",     # Dynamic port for CDP sharing
-            ],
+            args=chromium_args,
         )
 
-        # Capture WebSocket endpoint for CDP subprocess sharing
-        # Playwright stores this when launching with remote debugging enabled
-        try:
-            cdp = await self._browser.new_browser_cdp_session()
-            # Get browser info to construct ws endpoint
-            info = await cdp.send("Browser.getVersion")
-            await cdp.detach()
-            # The ws endpoint is available on the browser's connection
-            # Use Playwright's internal ws URL which is always available
-            ws_url = self._browser._channel._connection._transport._ws_endpoint
-            self._ws_endpoint = ws_url
-            logger.info("CDP endpoint captured for subprocess sharing.")
-        except Exception as e:
+        if await self._wait_for_cdp_endpoint(self._ws_endpoint):
+            logger.info("CDP endpoint ready for subprocess sharing: %s", self._ws_endpoint)
+        else:
             logger.warning(
-                "Could not capture CDP endpoint (subprocess mode unavailable): %s", e
+                "CDP endpoint did not become ready; subprocess mode unavailable."
             )
             self._ws_endpoint = None
 
@@ -180,6 +230,7 @@ class SessionManager:
         # Restore cookies/localStorage if available
         if os.path.exists(self.config.cookie_file):
             try:
+                self._restrict_file_permissions(self.config.cookie_file)
                 context_opts["storage_state"] = self.config.cookie_file
                 logger.info("Restoring session from storage state...")
             except Exception as e:
@@ -278,7 +329,27 @@ class SessionManager:
 
             is_logged = await self._page.evaluate("""
                 () => {
-                    // Check for logged-in indicators
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.visibility === 'hidden' || style.display === 'none') {
+                            return false;
+                        }
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+
+                    const loginIndicators = [
+                        'a[href="/login"]',
+                        'a[href*="/login"]',
+                        'input[name="username"]',
+                        'input[autocomplete="username"]',
+                        'input[type="password"]',
+                    ];
+                    for (const sel of loginIndicators) {
+                        const el = document.querySelector(sel);
+                        if (isVisible(el)) return false;
+                    }
+
                     const indicators = [
                         '[data-cy="user-menu"]',
                         '.user-username-component',
@@ -286,13 +357,15 @@ class SessionManager:
                         '.nav-link-profile',
                         'a[href*="/member/"]',
                         '.profile-popup-component',
+                        'a[href*="/settings"]',
+                        'button[aria-label*="Account"]',
+                        'button[aria-label*="account"]',
                     ];
                     for (const sel of indicators) {
-                        if (document.querySelector(sel)) return true;
+                        const el = document.querySelector(sel);
+                        if (isVisible(el)) return true;
                     }
-                    // Check if login button is absent
-                    const loginBtn = document.querySelector('a[href="/login"], a[href*="/login"]');
-                    return !loginBtn;
+                    return false;
                 }
             """)
 
@@ -306,6 +379,7 @@ class SessionManager:
         """Save cookies AND localStorage to file for session persistence."""
         try:
             await self._context.storage_state(path=self.config.cookie_file)
+            self._restrict_file_permissions(self.config.cookie_file)
             logger.info("Storage state saved (cookies + localStorage).")
         except Exception as e:
             logger.warning("Failed to save storage state: %s", e)

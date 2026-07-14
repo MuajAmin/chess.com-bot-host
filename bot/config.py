@@ -48,6 +48,8 @@ DEFAULTS = {
         "headless": True,
         "log_level": "INFO",
         "max_context_games": 3,  # Recreate browser context every N games
+        "worker_timeout_seconds": 7200,
+        "browser_no_sandbox": False,
     },
 }
 
@@ -73,7 +75,7 @@ class Config:
             user_config = yaml.safe_load(f) or {}
 
         # Deep merge: defaults ← user config
-        self._data = self._deep_merge(DEFAULTS, user_config)
+        self._data = self._expand_env_values(self._deep_merge(DEFAULTS, user_config))
 
     def _deep_merge(self, base, override):
         """Recursively merge override dict into base dict."""
@@ -85,22 +87,33 @@ class Config:
                 result[key] = value
         return result
 
+    def _expand_env_values(self, value):
+        """Expand environment variables in string config values."""
+        if isinstance(value, dict):
+            return {k: self._expand_env_values(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._expand_env_values(v) for v in value]
+        if isinstance(value, str):
+            expanded = os.path.expandvars(value)
+            if expanded == value and value.startswith("${") and value.endswith("}"):
+                return ""
+            return expanded
+        return value
+
     def _validate(self):
         """Validate critical config values."""
         errors = []
-
-        if not self.username:
-            errors.append("account.username is required")
-
-        # Password only required when login_mode is not cookie_only
-        if self.login_mode != "cookie_only" and not self.password:
-            errors.append("account.password is required (login_mode is not 'cookie_only')")
 
         if self.login_mode not in ("cookie_only", "credentials", "auto"):
             errors.append(
                 f"account.login_mode must be 'cookie_only', 'credentials', or 'auto', "
                 f"got: {self.login_mode}"
             )
+        elif self.login_mode != "cookie_only":
+            if not self.username:
+                errors.append("account.username is required unless login_mode is 'cookie_only'")
+            if not self.password:
+                errors.append("account.password is required unless login_mode is 'cookie_only'")
 
         if not self.engine_weights:
             errors.append("engine.weights path is required")
@@ -112,6 +125,8 @@ class Config:
             errors.append(f"challenge.mode must be 'whitelist' or 'open', got: {self.challenge_mode}")
         if self.humanizer_delay_min > self.humanizer_delay_max:
             errors.append("humanizer.delay_min must be <= humanizer.delay_max")
+        if self.worker_timeout_seconds <= 0:
+            errors.append("server.worker_timeout_seconds must be > 0")
 
         if errors:
             print("CONFIG ERRORS:")
@@ -234,6 +249,17 @@ class Config:
     @property
     def max_context_games(self):
         return self._data["server"].get("max_context_games", 3)
+
+    @property
+    def worker_timeout_seconds(self):
+        try:
+            return int(self._data["server"].get("worker_timeout_seconds", 7200))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def browser_no_sandbox(self):
+        return bool(self._data["server"].get("browser_no_sandbox", False))
 
     # --- Notifications ---
     @property

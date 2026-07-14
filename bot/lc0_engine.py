@@ -31,7 +31,15 @@ class Lc0Engine:
         self._is_maia = self._detect_maia()
 
     def _detect_maia(self):
-        """Detect if we're using Maia weights (human-like policy network)."""
+        """Decide whether to use Maia policy-only mode."""
+        if self.config.engine_type == "maia":
+            logger.info("engine.type=maia; using nodes=1 (policy-only mode).")
+            return True
+        if self.config.engine_type == "lc0":
+            logger.info("engine.type=lc0; using standard time-based search.")
+            return False
+
+        # auto: detect from weights filename for backward compatibility.
         weights = self.config.engine_weights.lower()
         is_maia = "maia" in weights
         if is_maia:

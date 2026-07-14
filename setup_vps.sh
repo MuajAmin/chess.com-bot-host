@@ -47,10 +47,20 @@ apt-get install -y \
 
 # --- Create bot user and directory ---
 echo "[5/7] Setting up bot directory..."
+BOT_USER="bot"
 BOT_DIR="/home/bot/chess.com_bot_host"
+
+if ! id -u "$BOT_USER" >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir /home/bot --shell /usr/sbin/nologin "$BOT_USER"
+fi
+BOT_GROUP="$(id -gn "$BOT_USER")"
+
 mkdir -p "$BOT_DIR"
 mkdir -p "$BOT_DIR/logs"
 mkdir -p "$BOT_DIR/weights"
+chown -R "$BOT_USER:$BOT_GROUP" /home/bot
+chmod 750 /home/bot "$BOT_DIR"
+chmod 700 "$BOT_DIR/logs" "$BOT_DIR/weights"
 
 # --- Python virtual environment ---
 echo "[6/7] Setting up Python environment..."
@@ -59,7 +69,10 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-playwright install chromium
+chown -R "$BOT_USER:$BOT_GROUP" "$BOT_DIR"
+chmod 750 "$BOT_DIR"
+chmod 700 "$BOT_DIR/logs" "$BOT_DIR/weights"
+runuser -u "$BOT_USER" -- "$BOT_DIR/venv/bin/python" -m playwright install chromium
 
 # --- Download Lc0 CPU binary ---
 echo "[7/7] Downloading Lc0 CPU binary..."
@@ -114,11 +127,15 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=bot
+Group=bot
+UMask=0077
 WorkingDirectory=/home/bot/chess.com_bot_host
 ExecStart=/home/bot/chess.com_bot_host/venv/bin/python -m bot.main
 Restart=always
 RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
 StandardOutput=append:/home/bot/chess.com_bot_host/logs/bot.log
 StandardError=append:/home/bot/chess.com_bot_host/logs/bot_error.log
 
@@ -128,6 +145,13 @@ EOF
 
 systemctl daemon-reload
 systemctl enable chess-bot.service
+
+for secret_file in "$BOT_DIR/config.yaml" "$BOT_DIR/session_cookies.json"; do
+    if [ -f "$secret_file" ]; then
+        chown "$BOT_USER:$BOT_GROUP" "$secret_file"
+        chmod 600 "$secret_file"
+    fi
+done
 
 echo ""
 echo "============================================"
