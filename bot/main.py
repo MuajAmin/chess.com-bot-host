@@ -22,7 +22,6 @@ failed), falls back to in-process game loop (original behavior).
 import asyncio
 import gc
 import logging
-import subprocess
 import sys
 import os
 from datetime import datetime, timedelta
@@ -38,6 +37,8 @@ from bot.game_tracker import GameTracker
 from bot.notifier import Notifier
 
 logger = logging.getLogger(__name__)
+
+WORKER_TIMEOUT_RETURN_CODE = 124
 
 
 async def play_game_inprocess(session, config, board_parser, engine, humanizer, move_maker, game_tracker):
