@@ -85,9 +85,13 @@ async def main():
         # Wait for user to login — poll until URL changes or user presses Enter
         input("Press ENTER here after you've logged in successfully...")
 
-        # Verify login
-        await page.goto(CHESS_COM_HOME, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
+        # Verify login (best-effort — chess.com may redirect)
+        try:
+            await page.goto(CHESS_COM_HOME, wait_until="domcontentloaded", timeout=10000)
+        except Exception:
+            pass  # chess.com often redirects to membership/trial pages
+
+        await page.wait_for_timeout(2000)
 
         current_url = page.url
         title = await page.title()

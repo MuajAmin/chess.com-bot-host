@@ -192,26 +192,80 @@ class ChallengeListener:
             True if successfully accepted
         """
         try:
-            # Try clicking "Accept" button within the challenge element
+            # Comprehensive list of accept button selectors
             accept_selectors = [
                 'button:has-text("Accept")',
                 'button:has-text("Play")',
+                'button:has-text("accept")',
+                'button:has-text("play")',
                 '.challenge-accept',
                 '[class*="accept"]',
+                '[class*="Accept"]',
+                '[data-cy="accept"]',
+                '[data-testid*="accept"]',
                 'button.accept',
+                # Chess.com specific patterns
+                '[class*="challenge"] button',
+                '[class*="Challenge"] button',
+                '[class*="notification"] button',
+                '[class*="Notification"] button',
+                '.cc-button-primary',
+                '.cc-button-component',
+                'button[class*="primary"]',
+                'button[class*="green"]',
+                'button[class*="confirm"]',
             ]
 
             # First try within the challenge element
             challenge_el = challenge.get("element")
             if challenge_el:
                 for selector in accept_selectors:
-                    btn = challenge_el.locator(selector)
-                    for index in range(await btn.count()):
+                    try:
+                        btn = challenge_el.locator(selector)
+                        count = await btn.count()
+                        for index in range(count):
+                            candidate = btn.nth(index)
+                            if await candidate.is_visible():
+                                await candidate.click()
+                                logger.info("Accepted via button: %s (in challenge element)", selector)
+                                return True
+                    except Exception:
+                        continue
+
+            # Second pass: search the ENTIRE page for accept buttons
+            page = self.page
+            for selector in accept_selectors:
+                try:
+                    btn = page.locator(selector)
+                    count = await btn.count()
+                    for index in range(count):
                         candidate = btn.nth(index)
                         if await candidate.is_visible():
                             await candidate.click()
-                            logger.info("Accepted via button: %s (in challenge)", selector)
+                            logger.info("Accepted via button: %s (page-wide search)", selector)
                             return True
+                except Exception:
+                    continue
+
+            # Third pass: JavaScript-based accept (find any visible button
+            # with accept/play text and click it)
+            js_accepted = await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll('button, [role="button"], a.btn, a.button');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || '').trim().toLowerCase();
+                        const isVisible = btn.offsetParent !== null && btn.offsetWidth > 0;
+                        if (isVisible && (text === 'accept' || text === 'play' || text.includes('accept'))) {
+                            btn.click();
+                            return 'clicked: ' + text;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if js_accepted:
+                logger.info("Accepted via JS click: %s", js_accepted)
+                return True
 
             # Last resort: click the challenge element itself
             if challenge_el:
@@ -221,12 +275,50 @@ class ChallengeListener:
                     logger.info("Clicked challenge element directly")
                     return True
 
+            # DEBUG: dump info to help fix selectors
+            await self._debug_challenge_dom(challenge_el)
+
             logger.warning("Could not find accept button for challenge")
             return False
 
         except Exception as e:
             logger.error("Failed to accept challenge: %s", e)
             return False
+
+    async def _debug_challenge_dom(self, challenge_el):
+        """Dump challenge element HTML and take screenshot for debugging."""
+        try:
+            # Dump the challenge element's outer HTML
+            if challenge_el:
+                html = await challenge_el.evaluate("el => el.outerHTML")
+                logger.warning("Challenge element HTML:\n%s", html[:2000])
+
+            # Dump all visible buttons on the page
+            buttons_info = await self.page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll('button, [role="button"]');
+                    const result = [];
+                    for (const btn of buttons) {
+                        const isVisible = btn.offsetParent !== null && btn.offsetWidth > 0;
+                        if (isVisible) {
+                            result.push({
+                                tag: btn.tagName,
+                                text: (btn.textContent || '').trim().substring(0, 80),
+                                classes: btn.className.substring(0, 120),
+                            });
+                        }
+                    }
+                    return result;
+                }
+            """)
+            logger.warning("Visible buttons on page: %s", buttons_info)
+
+            # Take a debug screenshot
+            screenshot_path = "./logs/challenge_debug.png"
+            await self.page.screenshot(path=screenshot_path)
+            logger.warning("Challenge debug screenshot saved: %s", screenshot_path)
+        except Exception as e:
+            logger.debug("Debug dump failed: %s", e)
 
     async def decline_challenge(self, challenge):
         """Decline a challenge (for unwanted challengers)."""
