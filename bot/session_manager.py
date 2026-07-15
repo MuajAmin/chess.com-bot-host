@@ -516,19 +516,60 @@ class SessionManager:
             await login_button.click()
             logger.info("Login submitted. Waiting for redirect...")
 
-            # Wait for redirect (away from /login)
-            await self._page.wait_for_url(
-                lambda url: "/login" not in url,
-                timeout=20000,
-            )
-            await self._page.wait_for_timeout(3000)
+            # Soft-poll for redirect (chess.com may use AJAX / SPA login)
+            redirected = False
+            for _ in range(20):
+                await self._page.wait_for_timeout(1000)
+                current_url = self._page.url
+                if "/login" not in current_url:
+                    redirected = True
+                    logger.info("Redirect detected → %s", current_url)
+                    break
+
+            if not redirected:
+                current_url = self._page.url
+                page_title = await self._page.title()
+                logger.warning(
+                    "No redirect after 20s. URL=%s, Title=%s",
+                    current_url, page_title,
+                )
+                # Check for login error messages on the page
+                error_text = await self._page.evaluate("""
+                    () => {
+                        const errorEls = document.querySelectorAll(
+                            '[class*="error"], [class*="alert"], [class*="invalid"], ' +
+                            '[class*="form-error"], [role="alert"]'
+                        );
+                        const texts = [];
+                        for (const el of errorEls) {
+                            const t = el.textContent.trim();
+                            if (t) texts.push(t);
+                        }
+                        return texts.join(' | ');
+                    }
+                """)
+                if error_text:
+                    logger.error("Login page error message(s): %s", error_text)
+
+            await self._page.wait_for_timeout(2000)
 
             if await self._is_logged_in():
                 logger.info("Login successful: %s", self.config.username)
                 await self._save_storage_state()
                 return True
             else:
-                logger.error("Login failed — could not verify logged-in state.")
+                # Take screenshot for debugging before returning
+                try:
+                    screenshot_path = "./logs/login_debug.png"
+                    os.makedirs("./logs", exist_ok=True)
+                    await self._page.screenshot(path=screenshot_path, full_page=True)
+                    logger.error("Debug screenshot saved: %s", screenshot_path)
+                except Exception:
+                    pass
+                logger.error(
+                    "Login failed — could not verify logged-in state. "
+                    "Final URL: %s", self._page.url,
+                )
                 return False
 
         except Exception as e:
