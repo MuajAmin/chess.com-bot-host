@@ -42,7 +42,7 @@ DEFAULTS = {
         "webhook_url": "",  # Telegram/Discord webhook URL (empty = disabled)
     },
     "server": {
-        "check_interval": 12,
+        "check_interval": 1,
         "max_games_per_day": 5,
         "cookie_file": "session_cookies.json",
         "headless": True,

@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 # How many times to dump debug info (avoid spamming logs)
 _MAX_DEBUG_DUMPS = 3
 _CHALLENGE_MARKER_ATTR = "data-bot-challenge-id"
+_NAVIGATION_SETTLE_MS = 500
+_POST_ACCEPT_SETTLE_MS = 250
+_GAME_VERIFY_TIMEOUT_MS = 8000
+_GAME_VERIFY_POLL_MS = 250
 
 
 class ChallengeListener:
@@ -42,7 +46,7 @@ class ChallengeListener:
             current_url = self.page.url
             if "/play" not in current_url and "/home" not in current_url:
                 await self.page.goto(self.PLAY_URL, wait_until="domcontentloaded", timeout=20000)
-                await self.page.wait_for_timeout(2000)
+                await self.page.wait_for_timeout(_NAVIGATION_SETTLE_MS)
 
             # Look for incoming challenge notifications
             challenge = await self._find_challenge()
@@ -67,7 +71,7 @@ class ChallengeListener:
             if accepted:
                 logger.info("Accepted challenge from: %s", challenger_name)
                 # Wait for game to load and verify
-                await self.page.wait_for_timeout(3000)
+                await self.page.wait_for_timeout(_POST_ACCEPT_SETTLE_MS)
 
                 # CRITICAL: Verify we're actually on a game page
                 if await self._verify_game_started():
@@ -189,6 +193,76 @@ class ChallengeListener:
                             buttonCount: buttons.length,
                         };
                     };
+
+                    const attrsFor = (el) => [
+                        el.getAttribute?.('aria-label') || '',
+                        el.getAttribute?.('title') || '',
+                        el.getAttribute?.('data-cy') || '',
+                        el.getAttribute?.('data-icon') || '',
+                        getClass(el),
+                        (el.textContent || '').trim(),
+                    ].join(' ').toLowerCase();
+
+                    const hasAcceptSignal = (el) => {
+                        const attrs = attrsFor(el);
+                        return attrs.includes('accept') ||
+                            attrs.includes('confirm') ||
+                            attrs.includes('check') ||
+                            attrs.includes('success') ||
+                            attrs.includes('positive') ||
+                            attrs.includes('green');
+                    };
+
+                    const hasDeclineSignal = (el) => {
+                        const attrs = attrsFor(el);
+                        return attrs.includes('decline') ||
+                            attrs.includes('reject') ||
+                            attrs.includes('cancel') ||
+                            attrs.includes('close') ||
+                            attrs.includes('negative') ||
+                            attrs.includes('red');
+                    };
+
+                    const containerLooksLikeChallenge = (container) => {
+                        const text = (container.textContent || '').trim();
+                        const cls = getClass(container).toLowerCase();
+                        return looksLikeChallengeText(text) ||
+                            text.toLowerCase().includes('challenged') ||
+                            cls.includes('challenge') ||
+                            !!container.querySelector('a[href*="/member/"]');
+                    };
+
+                    // Fast path: find an accept/decline pair and walk to its challenge container.
+                    const possibleActions = document.querySelectorAll(
+                        'button, [role="button"], a[href], [aria-label], [title], [data-cy], [data-icon], ' +
+                        '[class*="accept"], [class*="decline"], [class*="reject"], [class*="challenge"]'
+                    );
+                    for (const action of possibleActions) {
+                        if (!isVisible(action) || !hasAcceptSignal(action)) continue;
+
+                        let container = action;
+                        for (let i = 0; i < 7; i++) {
+                            if (!container.parentElement) break;
+                            container = container.parentElement;
+                            if (!isVisible(container)) continue;
+
+                            const controls = Array.from(container.querySelectorAll(clickableSelector))
+                                .filter(isVisible);
+                            const hasDecline = controls.some(hasDeclineSignal);
+
+                            if (
+                                controls.length >= 2 &&
+                                hasDecline &&
+                                containerLooksLikeChallenge(container)
+                            ) {
+                                return buildInfo(
+                                    container,
+                                    'action_pair',
+                                    (container.textContent || '').trim()
+                                );
+                            }
+                        }
+                    }
 
                     // Strategy 1: Look for challenge text with nearby action controls.
                     for (const el of document.querySelectorAll('*')) {

@@ -40,7 +40,7 @@ notifications:
                               # Discord: https://discord.com/api/webhooks/<ID>/<TOKEN>
 
 server:
-  check_interval: 12         # seconds between challenge checks
+  check_interval: 1          # seconds between challenge checks
   max_games_per_day: 5       # daily game limit to avoid suspicion
   cookie_file: "session_cookies.json"
   headless: true             # false for debugging (shows browser)
