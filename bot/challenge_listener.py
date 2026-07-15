@@ -8,11 +8,14 @@ not text buttons. The detection must account for this.
 """
 
 import logging
+import re
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
 # How many times to dump debug info (avoid spamming logs)
 _MAX_DEBUG_DUMPS = 3
+_CHALLENGE_MARKER_ATTR = "data-bot-challenge-id"
 
 
 class ChallengeListener:
@@ -94,46 +97,122 @@ class ChallengeListener:
             # with specific structure. We look for elements that:
             # - Contain "Challenge" text (as in "10 min · Challenge")
             # - Have accept/decline icon buttons nearby
-            challenge_info = await self.page.evaluate("""
-                () => {
-                    // Strategy 1: Look for elements containing "Challenge" with
-                    // nearby clickable buttons (the ✓ and ✗ icons)
-                    const allEls = document.querySelectorAll('*');
-                    for (const el of allEls) {
-                        // Skip elements that are huge (like body, main containers)
-                        if (el.offsetHeight > 200 || el.offsetWidth > 600) continue;
-                        // Skip invisible elements
-                        if (el.offsetParent === null && el.tagName !== 'BODY') continue;
+            challenge_info = await self.page.evaluate(r"""
+                (markerAttr) => {
+                    const clickableSelector =
+                        'button, [role="button"], a[href], a[class*="btn"], [class*="icon"]';
+
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden';
+                    };
+
+                    const getClass = (el) => {
+                        if (!el) return '';
+                        return (
+                            el.getAttribute?.('class') ||
+                            (typeof el.className === 'string' ? el.className : el.className?.baseVal) ||
+                            ''
+                        ).toString();
+                    };
+
+                    const makeMarker = () => (
+                        'challenge-' + Date.now().toString(36) + '-' +
+                        Math.random().toString(36).slice(2)
+                    );
+
+                    const extractUsername = (container) => {
+                        const selectors = [
+                            'a[href*="/member/"]',
+                            '[data-username]',
+                            '[data-user-name]',
+                            '[data-test-user]',
+                            '[class*="username"]',
+                            '[class*="user-name"]',
+                        ];
+
+                        for (const selector of selectors) {
+                            const node = container.querySelector(selector);
+                            if (!node) continue;
+
+                            const href = node.getAttribute?.('href') || '';
+                            const hrefMatch = href.match(/\/member\/([^"'/?#\s]+)/i);
+                            if (hrefMatch) return decodeURIComponent(hrefMatch[1]);
+
+                            for (const attr of ['data-username', 'data-user-name', 'data-test-user', 'aria-label', 'title']) {
+                                const value = (node.getAttribute?.(attr) || '').trim();
+                                const attrMatch = value.match(/[A-Za-z0-9_-]{3,25}/);
+                                if (attrMatch) return attrMatch[0];
+                            }
+
+                            const textMatch = (node.textContent || '').trim().match(/[A-Za-z0-9_-]{3,25}/);
+                            if (textMatch) return textMatch[0];
+                        }
+
+                        const img = container.querySelector('img[alt]');
+                        if (img) {
+                            const alt = (img.getAttribute('alt') || '').trim();
+                            const altMatch = alt.match(/^([A-Za-z0-9_-]{3,25})(?:'s| profile| avatar|$)/i);
+                            if (altMatch) return altMatch[1];
+                        }
+
+                        return '';
+                    };
+
+                    const challengeTextRe = /\bchallenge\b/i;
+                    const timeTextRe =
+                        /\b(\d+\s*(min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours)|daily|bullet|blitz|rapid|classical|correspondence|rated|unrated)\b/i;
+                    const looksLikeChallengeText = (text) =>
+                        challengeTextRe.test(text) && timeTextRe.test(text);
+
+                    const buildInfo = (container, method, sourceText) => {
+                        const marker = makeMarker();
+                        container.setAttribute(markerAttr, marker);
+                        const buttons = container.querySelectorAll(clickableSelector);
+                        const containerText = (container.textContent || '').trim();
+
+                        return {
+                            found: true,
+                            method,
+                            marker,
+                            username: extractUsername(container),
+                            containerTag: container.tagName,
+                            containerClass: getClass(container).substring(0, 200),
+                            containerHTML: container.outerHTML.substring(0, 5000),
+                            text: (sourceText || containerText).substring(0, 200),
+                            containerText: containerText.substring(0, 1000),
+                            buttonCount: buttons.length,
+                        };
+                    };
+
+                    // Strategy 1: Look for challenge text with nearby action controls.
+                    for (const el of document.querySelectorAll('*')) {
+                        if (!isVisible(el)) continue;
+
+                        const rect = el.getBoundingClientRect();
+                        if (rect.height > 250 || rect.width > 900) continue;
 
                         const text = (el.textContent || '').trim();
-                        // Look for challenge notification text patterns
-                        if (text.includes('Challenge') && text.includes('min')) {
-                            // Found a challenge notification — get its parent container
-                            let container = el;
-                            // Walk up to find the notification container with buttons
-                            for (let i = 0; i < 5; i++) {
-                                if (!container.parentElement) break;
-                                container = container.parentElement;
-                                const buttons = container.querySelectorAll(
-                                    'button, [role="button"], a[class*="btn"], [class*="icon"]'
-                                );
-                                if (buttons.length >= 2) {
-                                    return {
-                                        found: true,
-                                        method: 'text_scan',
-                                        containerTag: container.tagName,
-                                        containerClass: (container.className || '').substring(0, 200),
-                                        containerHTML: container.outerHTML.substring(0, 3000),
-                                        text: text.substring(0, 200),
-                                        buttonCount: buttons.length,
-                                    };
-                                }
+                        if (!looksLikeChallengeText(text)) continue;
+
+                        let container = el;
+                        for (let i = 0; i < 5; i++) {
+                            if (!container.parentElement) break;
+                            container = container.parentElement;
+
+                            const buttons = container.querySelectorAll(clickableSelector);
+                            if (buttons.length >= 2 && isVisible(container)) {
+                                return buildInfo(container, 'text_scan', text);
                             }
                         }
                     }
 
-                    // Strategy 2: Look for elements with challenge-related classes
-                    // that also have interactive children
+                    // Strategy 2: Look for challenge-related containers with controls.
                     const challengeEls = document.querySelectorAll(
                         '[class*="challenge-notification"], ' +
                         '[class*="challenge-popup"], ' +
@@ -145,21 +224,15 @@ class ChallengeListener:
                     );
 
                     for (const el of challengeEls) {
-                        if (el.offsetParent === null && el.style.display !== 'fixed') continue;
-                        return {
-                            found: true,
-                            method: 'class_match',
-                            containerTag: el.tagName,
-                            containerClass: (el.className || '').substring(0, 200),
-                            containerHTML: el.outerHTML.substring(0, 3000),
-                            text: (el.textContent || '').trim().substring(0, 200),
-                            buttonCount: el.querySelectorAll('button, [role="button"]').length,
-                        };
+                        if (!isVisible(el)) continue;
+                        const buttons = el.querySelectorAll(clickableSelector);
+                        if (buttons.length < 1) continue;
+                        return buildInfo(el, 'class_match', (el.textContent || '').trim());
                     }
 
                     return { found: false };
                 }
-            """)
+            """, _CHALLENGE_MARKER_ATTR)
 
             if challenge_info and challenge_info.get("found"):
                 method = challenge_info.get("method", "unknown")
@@ -175,8 +248,8 @@ class ChallengeListener:
                 container_class = challenge_info.get("containerClass", "")
                 container_html = challenge_info.get("containerHTML", "")
 
-                # Try to extract challenger username from the HTML
-                username = self._extract_username_from_html(container_html)
+                # Try to extract challenger username from structured fields, HTML, then text.
+                username = self._extract_username(challenge_info, container_html)
 
                 # Create a locator for the challenge container
                 element = await self._find_challenge_element(container_class, challenge_info)
@@ -185,6 +258,7 @@ class ChallengeListener:
                     "info": challenge_info,
                     "element": element,
                     "username": username,
+                    "marker": challenge_info.get("marker"),
                     "container_html": container_html,
                 }
 
@@ -194,18 +268,117 @@ class ChallengeListener:
             logger.debug("Challenge search error: %s", e)
             return None
 
+    def _extract_username(self, challenge_info, html):
+        """Extract username from structured fields, HTML, then visible text."""
+        candidates = [
+            challenge_info.get("username"),
+            self._extract_username_from_html(html),
+            self._extract_username_from_text(challenge_info.get("containerText", "")),
+            self._extract_username_from_text(challenge_info.get("text", "")),
+        ]
+
+        for candidate in candidates:
+            username = self._clean_username(candidate)
+            if username != "unknown":
+                return username
+
+        logger.warning(
+            "Could not extract challenger username from challenge text: %s",
+            challenge_info.get("containerText") or challenge_info.get("text", ""),
+        )
+        return "unknown"
+
     def _extract_username_from_html(self, html):
         """Extract username from challenge notification HTML."""
-        import re
-        # Look for member links
-        match = re.search(r'/member/([^"\'/?]+)', html)
-        if match:
-            return match.group(1)
+        html = html or ""
+        patterns = [
+            r'/member/([^"\'\s<>/?#]+)',
+            r'data-username=["\']([^"\']+)["\']',
+            r'data-user-name=["\']([^"\']+)["\']',
+            r'data-test-user=["\']([^"\']+)["\']',
+            r'(?:aria-label|title)=["\']([A-Za-z0-9_-]{3,25})(?:\'s| profile| avatar|$)',
+            r'alt=["\']([A-Za-z0-9_-]{3,25})(?:\'s| profile| avatar|$)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+
         return "unknown"
+
+    def _extract_username_from_text(self, text):
+        """Best-effort fallback for notification text that contains the username."""
+        text = " ".join((text or "").split())
+        if not text:
+            return "unknown"
+
+        patterns = [
+            r'\bfrom\s+([A-Za-z0-9_-]{3,25})\b',
+            r'\b([A-Za-z0-9_-]{3,25})\b\s+(?:challenged|is challenging|sent)',
+            r'^([A-Za-z0-9_-]{3,25})\b.*\bchallenge\b',
+        ]
+        skip_words = {
+            "accept",
+            "blitz",
+            "bullet",
+            "challenge",
+            "challenged",
+            "classical",
+            "correspondence",
+            "daily",
+            "decline",
+            "game",
+            "hour",
+            "hours",
+            "min",
+            "mins",
+            "minute",
+            "minutes",
+            "play",
+            "rapid",
+            "rated",
+            "sec",
+            "secs",
+            "second",
+            "seconds",
+            "unrated",
+            "you",
+        }
+
+        own_username = self._clean_username(getattr(self.config, "username", ""))
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+
+            username = self._clean_username(match.group(1))
+            if (
+                username != "unknown" and
+                username.lower() not in skip_words and
+                username.lower() != own_username.lower() and
+                not username.isdigit()
+            ):
+                return username
+
+        return "unknown"
+
+    @staticmethod
+    def _clean_username(username):
+        """Normalize extracted Chess.com usernames."""
+        username = unquote((username or "").strip().strip("@"))
+        match = re.match(r"^[A-Za-z0-9_-]{3,25}$", username)
+        return username if match else "unknown"
 
     async def _find_challenge_element(self, container_class, challenge_info):
         """Create a Playwright locator for the challenge container."""
         try:
+            marker = challenge_info.get("marker")
+            if marker:
+                loc = self.page.locator(f'[{_CHALLENGE_MARKER_ATTR}="{marker}"]')
+                if await loc.count() > 0:
+                    return loc.first
+
             # Try using the first specific class from the container
             if container_class:
                 classes = container_class.split()
@@ -213,7 +386,7 @@ class ChallengeListener:
                     cls = cls.strip()
                     if not cls or len(cls) < 3:
                         continue
-                    selector = f".{cls}"
+                    selector = f'[class~="{cls}"]'
                     try:
                         loc = self.page.locator(selector)
                         if await loc.count() > 0:
@@ -266,108 +439,174 @@ class ChallengeListener:
             True if successfully clicked accept
         """
         try:
-            container_html = challenge.get("container_html", "")
             challenge_el = challenge.get("element")
+            marker = challenge.get("marker")
 
             # ── Method 1: JavaScript-based accept ──
             # Find the first green/accept button within the challenge notification
             # and click it. This is the most reliable approach.
-            js_result = await self.page.evaluate("""
-                () => {
-                    // Find the challenge notification container
-                    const allEls = document.querySelectorAll('*');
-                    let container = null;
+            js_result = await self.page.evaluate(r"""
+                ({ markerAttr, marker }) => {
+                    const actionSelector = 'button, [role="button"], a[href]';
+                    const clickableSelector = `${actionSelector}, [class*="icon"], svg`;
 
-                    for (const el of allEls) {
-                        if (el.offsetHeight > 200 || el.offsetWidth > 600) continue;
-                        if (el.offsetParent === null && el.tagName !== 'BODY') continue;
-                        const text = (el.textContent || '').trim();
-                        if (text.includes('Challenge') && text.includes('min')) {
-                            // Walk up to find container with buttons
-                            let cur = el;
+                    const getClass = (el) => {
+                        if (!el) return '';
+                        return (
+                            el.getAttribute?.('class') ||
+                            (typeof el.className === 'string' ? el.className : el.className?.baseVal) ||
+                            ''
+                        ).toString();
+                    };
+
+                    const getClickable = (el) => (
+                        el?.closest?.(actionSelector) || el
+                    );
+
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden';
+                    };
+
+                    const attrsFor = (node, target) => {
+                        const values = [];
+                        for (const el of [node, target]) {
+                            if (!el) continue;
+                            values.push(
+                                el.getAttribute?.('aria-label') || '',
+                                el.getAttribute?.('title') || '',
+                                el.getAttribute?.('data-cy') || '',
+                                el.getAttribute?.('data-icon') || '',
+                                getClass(el),
+                                (el.textContent || '').trim()
+                            );
+                        }
+                        return values.join(' ').toLowerCase();
+                    };
+
+                    const colorIsGreen = (value) => {
+                        const match = (value || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                        if (!match) return false;
+                        const [, r, g, b] = match.map(Number);
+                        return g > r * 1.3 && g > b * 1.3;
+                    };
+
+                    const describe = (node, target) => (
+                        attrsFor(node, target).substring(0, 80)
+                    );
+
+                    const clickNode = (node) => {
+                        const target = getClickable(node);
+                        if (typeof target.click === 'function') {
+                            target.click();
+                        } else {
+                            target.dispatchEvent(new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                            }));
+                        }
+                        return target;
+                    };
+
+                    const findMarkedContainer = () => {
+                        if (!marker) return null;
+                        return document.querySelector(`[${markerAttr}="${marker}"]`);
+                    };
+
+                    const findTextContainer = () => {
+                        const challengeTextRe = /\bchallenge\b/i;
+                        const timeTextRe =
+                            /\b(\d+\s*(min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours)|daily|bullet|blitz|rapid|classical|correspondence|rated|unrated)\b/i;
+
+                        for (const el of document.querySelectorAll('*')) {
+                            if (!isVisible(el)) continue;
+
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height > 250 || rect.width > 900) continue;
+
+                            const text = (el.textContent || '').trim();
+                            if (!challengeTextRe.test(text) || !timeTextRe.test(text)) continue;
+
+                            let container = el;
                             for (let i = 0; i < 5; i++) {
-                                if (!cur.parentElement) break;
-                                cur = cur.parentElement;
-                                const buttons = cur.querySelectorAll(
-                                    'button, [role="button"], a'
-                                );
-                                if (buttons.length >= 2) {
-                                    container = cur;
-                                    break;
+                                if (!container.parentElement) break;
+                                container = container.parentElement;
+
+                                const buttons = container.querySelectorAll(actionSelector);
+                                if (buttons.length >= 2 && isVisible(container)) {
+                                    return container;
                                 }
                             }
-                            if (container) break;
                         }
-                    }
+                        return null;
+                    };
 
+                    const container = findMarkedContainer() || findTextContainer();
                     if (!container) {
                         return { clicked: false, reason: 'no_container' };
                     }
 
-                    // Get all clickable elements in the container
-                    const clickables = container.querySelectorAll(
-                        'button, [role="button"], a, [class*="icon"], svg'
-                    );
+                    const clickables = Array.from(container.querySelectorAll(clickableSelector))
+                        .filter((node) => isVisible(node) || isVisible(getClickable(node)));
 
-                    // Strategy A: Look for accept-related attributes
-                    for (const btn of clickables) {
-                        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                        const title = (btn.getAttribute('title') || '').toLowerCase();
-                        const cls = (btn.className || '').toLowerCase();
-                        const text = (btn.textContent || '').trim().toLowerCase();
-                        const dataAttr = btn.getAttribute('data-cy') || '';
-
-                        if (aria.includes('accept') || title.includes('accept') ||
-                            cls.includes('accept') || text.includes('accept') ||
-                            aria.includes('confirm') || cls.includes('confirm') ||
-                            dataAttr.includes('accept')) {
-                            btn.click();
+                    // Strategy A: accept-related attributes/classes/text.
+                    for (const node of clickables) {
+                        const target = getClickable(node);
+                        const attrs = attrsFor(node, target);
+                        if (
+                            attrs.includes('accept') ||
+                            attrs.includes('confirm')
+                        ) {
+                            clickNode(node);
                             return {
                                 clicked: true,
                                 method: 'aria/class match',
-                                detail: aria || title || cls.substring(0, 50),
+                                detail: describe(node, target),
                             };
                         }
                     }
 
-                    // Strategy B: Look for green-colored or checkmark buttons
-                    for (const btn of clickables) {
-                        const style = window.getComputedStyle(btn);
-                        const bgColor = style.backgroundColor;
-                        const color = style.color;
-                        const cls = (btn.className || '').toLowerCase();
+                    // Strategy B: green/check/success action controls.
+                    for (const node of clickables) {
+                        const target = getClickable(node);
+                        const attrs = attrsFor(node, target);
+                        const styleTargets = [node, target].filter(Boolean);
+                        const isGreen = styleTargets.some((el) => {
+                            const style = window.getComputedStyle(el);
+                            return colorIsGreen(style.backgroundColor) || colorIsGreen(style.color);
+                        });
 
-                        // Green buttons (accept)
-                        const isGreen = (
-                            bgColor.includes('rgb(') && (() => {
-                                const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
-                                if (match) {
-                                    const [, r, g, b] = match.map(Number);
-                                    return g > r * 1.3 && g > b * 1.3;  // Green dominant
-                                }
-                                return false;
-                            })()
-                        ) || cls.includes('green') || cls.includes('success') ||
-                           cls.includes('positive') || cls.includes('check');
-
-                        if (isGreen) {
-                            btn.click();
+                        if (
+                            isGreen ||
+                            attrs.includes('green') ||
+                            attrs.includes('success') ||
+                            attrs.includes('positive') ||
+                            attrs.includes('check')
+                        ) {
+                            clickNode(node);
                             return {
                                 clicked: true,
                                 method: 'green/check button',
-                                detail: cls.substring(0, 50),
+                                detail: describe(node, target),
                             };
                         }
                     }
 
-                    // Strategy C: Click the FIRST button (usually accept is first)
-                    const buttons = container.querySelectorAll('button, [role="button"]');
+                    // Strategy C: click the first real action control in the container.
+                    const buttons = Array.from(container.querySelectorAll(actionSelector))
+                        .filter(isVisible);
                     if (buttons.length >= 2) {
                         buttons[0].click();
                         return {
                             clicked: true,
                             method: 'first button (positional)',
-                            detail: (buttons[0].className || '').substring(0, 50),
+                            detail: getClass(buttons[0]).substring(0, 50),
                         };
                     }
                     if (buttons.length === 1) {
@@ -375,24 +614,26 @@ class ChallengeListener:
                         return {
                             clicked: true,
                             method: 'only button',
-                            detail: (buttons[0].className || '').substring(0, 50),
+                            detail: getClass(buttons[0]).substring(0, 50),
                         };
                     }
 
-                    // Strategy D: Click any SVG-containing element (icon buttons)
-                    const svgParents = container.querySelectorAll('*:has(> svg)');
-                    if (svgParents.length >= 2) {
-                        svgParents[0].click();
+                    // Strategy D: icon-only controls where SVG is nested inside the button.
+                    const svgTargets = Array.from(container.querySelectorAll('svg'))
+                        .map(getClickable)
+                        .filter((el, index, arr) => el && isVisible(el) && arr.indexOf(el) === index);
+                    if (svgTargets.length >= 2) {
+                        clickNode(svgTargets[0]);
                         return {
                             clicked: true,
-                            method: 'first svg parent (icon button)',
-                            detail: (svgParents[0].className || '').substring(0, 50),
+                            method: 'first svg action (icon button)',
+                            detail: getClass(svgTargets[0]).substring(0, 50),
                         };
                     }
 
                     return { clicked: false, reason: 'no_accept_button_found' };
                 }
-            """)
+            """, {"markerAttr": _CHALLENGE_MARKER_ATTR, "marker": marker})
 
             if js_result and js_result.get("clicked"):
                 logger.info(
@@ -406,6 +647,11 @@ class ChallengeListener:
             logger.warning("JS accept failed: %s", reason)
 
             # ── Method 2: Playwright selectors as fallback ──
+            if not challenge_el:
+                logger.warning("No challenge container locator available; skipping broad accept fallback.")
+                await self._debug_challenge_dom(None)
+                return False
+
             accept_selectors = [
                 'button:has-text("Accept")',
                 'button:has-text("Play")',
@@ -421,13 +667,13 @@ class ChallengeListener:
 
             for selector in accept_selectors:
                 try:
-                    btn = self.page.locator(selector)
+                    btn = challenge_el.locator(selector)
                     count = await btn.count()
                     for index in range(count):
                         candidate = btn.nth(index)
                         if await candidate.is_visible():
                             await candidate.click()
-                            logger.info("Accepted via Playwright: %s", selector)
+                            logger.info("Accepted via scoped Playwright selector: %s", selector)
                             return True
                 except Exception:
                     continue
@@ -487,7 +733,7 @@ class ChallengeListener:
             # Wait a bit more and check URL again
             await self.page.wait_for_timeout(3000)
             url = self.page.url
-            if "/game/live/" in url or "/game/daily/" in url:
+            if "/game/live/" in url or "/game/daily/" in url or "/play/game/" in url:
                 return True
 
             logger.warning("Not on a game page. URL: %s", url)
@@ -544,60 +790,161 @@ class ChallengeListener:
     async def decline_challenge(self, challenge):
         """Decline a challenge (for unwanted challengers)."""
         try:
-            # Use JavaScript to find and click the decline/X button
-            js_result = await self.page.evaluate("""
-                () => {
-                    const allEls = document.querySelectorAll('*');
-                    let container = null;
+            challenge_el = challenge.get("element")
+            marker = challenge.get("marker")
 
-                    for (const el of allEls) {
-                        if (el.offsetHeight > 200 || el.offsetWidth > 600) continue;
-                        if (el.offsetParent === null) continue;
-                        const text = (el.textContent || '').trim();
-                        if (text.includes('Challenge') && text.includes('min')) {
-                            let cur = el;
+            # Use JavaScript to find and click the decline/X button
+            js_result = await self.page.evaluate(r"""
+                ({ markerAttr, marker }) => {
+                    const actionSelector = 'button, [role="button"], a[href]';
+
+                    const getClass = (el) => {
+                        if (!el) return '';
+                        return (
+                            el.getAttribute?.('class') ||
+                            (typeof el.className === 'string' ? el.className : el.className?.baseVal) ||
+                            ''
+                        ).toString();
+                    };
+
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden';
+                    };
+
+                    const clickElement = (el) => {
+                        if (typeof el.click === 'function') {
+                            el.click();
+                        } else {
+                            el.dispatchEvent(new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                            }));
+                        }
+                    };
+
+                    const attrsFor = (el) => [
+                        el.getAttribute?.('aria-label') || '',
+                        el.getAttribute?.('title') || '',
+                        el.getAttribute?.('data-cy') || '',
+                        el.getAttribute?.('data-icon') || '',
+                        getClass(el),
+                        (el.textContent || '').trim(),
+                    ].join(' ').toLowerCase();
+
+                    const findMarkedContainer = () => {
+                        if (!marker) return null;
+                        return document.querySelector(`[${markerAttr}="${marker}"]`);
+                    };
+
+                    const findTextContainer = () => {
+                        const challengeTextRe = /\bchallenge\b/i;
+                        const timeTextRe =
+                            /\b(\d+\s*(min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours)|daily|bullet|blitz|rapid|classical|correspondence|rated|unrated)\b/i;
+
+                        for (const el of document.querySelectorAll('*')) {
+                            if (!isVisible(el)) continue;
+
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height > 250 || rect.width > 900) continue;
+
+                            const text = (el.textContent || '').trim();
+                            if (!challengeTextRe.test(text) || !timeTextRe.test(text)) continue;
+
+                            let container = el;
                             for (let i = 0; i < 5; i++) {
-                                if (!cur.parentElement) break;
-                                cur = cur.parentElement;
-                                const buttons = cur.querySelectorAll('button, [role="button"]');
-                                if (buttons.length >= 2) {
-                                    container = cur;
-                                    break;
+                                if (!container.parentElement) break;
+                                container = container.parentElement;
+
+                                const buttons = container.querySelectorAll(actionSelector);
+                                if (buttons.length >= 2 && isVisible(container)) {
+                                    return container;
                                 }
                             }
-                            if (container) break;
                         }
-                    }
+                        return null;
+                    };
 
+                    const container = findMarkedContainer() || findTextContainer();
                     if (!container) return false;
 
-                    // Decline is typically the second button or the one with X/close/decline
-                    const buttons = container.querySelectorAll('button, [role="button"]');
+                    const buttons = Array.from(container.querySelectorAll(actionSelector))
+                        .filter(isVisible);
+
                     for (const btn of buttons) {
-                        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                        const cls = (btn.className || '').toLowerCase();
-                        if (aria.includes('decline') || aria.includes('reject') ||
-                            aria.includes('close') || cls.includes('decline') ||
-                            cls.includes('reject') || cls.includes('close') ||
-                            cls.includes('red') || cls.includes('negative')) {
-                            btn.click();
+                        const attrs = attrsFor(btn);
+                        if (
+                            attrs.includes('decline') ||
+                            attrs.includes('reject') ||
+                            attrs.includes('close') ||
+                            attrs.includes('cancel') ||
+                            attrs.includes('red') ||
+                            attrs.includes('negative')
+                        ) {
+                            clickElement(btn);
                             return true;
                         }
                     }
 
-                    // Click the last button (usually decline is second/last)
+                    // Decline is typically the second/last action control.
                     if (buttons.length >= 2) {
-                        buttons[buttons.length - 1].click();
+                        clickElement(buttons[buttons.length - 1]);
                         return true;
                     }
 
                     return false;
                 }
-            """)
+            """, {"markerAttr": _CHALLENGE_MARKER_ATTR, "marker": marker})
 
             if js_result:
                 logger.info("Declined challenge")
                 return True
+
+            if not challenge_el:
+                return False
+
+            decline_selectors = [
+                '[aria-label*="decline" i]',
+                '[aria-label*="reject" i]',
+                '[aria-label*="close" i]',
+                '[aria-label*="cancel" i]',
+                '[title*="Decline"]',
+                '[title*="Reject"]',
+                '[data-cy*="decline" i]',
+                'button[class*="decline"]',
+                'button[class*="reject"]',
+                'button[class*="red"]',
+                'button[class*="negative"]',
+            ]
+
+            for selector in decline_selectors:
+                try:
+                    btn = challenge_el.locator(selector)
+                    count = await btn.count()
+                    for index in range(count):
+                        candidate = btn.nth(index)
+                        if await candidate.is_visible():
+                            await candidate.click()
+                            logger.info("Declined via scoped Playwright selector: %s", selector)
+                            return True
+                except Exception:
+                    continue
+
+            try:
+                buttons = challenge_el.locator('button, [role="button"]')
+                count = await buttons.count()
+                if count >= 2:
+                    await buttons.nth(count - 1).click()
+                    logger.info("Declined via scoped positional fallback")
+                    return True
+            except Exception:
+                pass
 
             return False
 
