@@ -100,6 +100,33 @@ class Humanizer:
         """Reset state for a new game."""
         self._move_number = 0
         self._total_think_time = 0.0
+        self._base_time = None
+        self._increment = None
+        self._our_time = None
+        self._opp_time = None
+
+    def set_time_control(self, base_time, increment):
+        """
+        Set the time control for the current game.
+
+        Args:
+            base_time: Base time in seconds (e.g., 600 for 10 min)
+            increment: Increment in seconds (e.g., 0, 2, 5)
+        """
+        self._base_time = base_time
+        self._increment = increment
+        logger.info("Time control set: %s+%s", base_time, increment)
+
+    def update_clocks(self, our_time, opp_time):
+        """
+        Update current clock readings for time-pressure-aware delays.
+
+        Args:
+            our_time: Our remaining time in seconds
+            opp_time: Opponent's remaining time in seconds
+        """
+        self._our_time = our_time
+        self._opp_time = opp_time
 
     async def apply_delay(self, board):
         """
