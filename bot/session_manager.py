@@ -335,49 +335,146 @@ class SessionManager:
                 'input[autocomplete="username"]'
             )
 
-            # Check if it's visible; if not, try scrolling to it or forcing visibility
+            # ── Make the username field visible (cascade of strategies) ──
+            field_visible = False
+
+            # Strategy 1: Already visible?
             try:
                 await username_input.wait_for(state="visible", timeout=5000)
+                field_visible = True
             except Exception:
-                logger.warning("Username field hidden. Attempting to force visibility...")
-                # Try scrolling into view
-                await username_input.scroll_into_view_if_needed(timeout=3000)
-                await self._page.wait_for_timeout(500)
+                logger.warning("Username field not visible. Trying fallback strategies...")
 
-                # If still hidden, force visibility via JS
+            # Strategy 2: Dismiss overlays again (chess.com sometimes lazy-loads them)
+            if not field_visible:
+                await self._dismiss_overlays()
+                await self._page.wait_for_timeout(1000)
                 try:
-                    await username_input.wait_for(state="visible", timeout=2000)
+                    await username_input.wait_for(state="visible", timeout=3000)
+                    field_visible = True
                 except Exception:
-                    logger.warning("Still hidden. Removing blocking overlays via JS...")
-                    await self._page.evaluate("""
-                        () => {
-                            // Remove all elements covering the login form
-                            const form = document.querySelector('form') ||
-                                         document.querySelector('[class*="login"]');
-                            if (!form) return;
+                    pass
 
-                            const rect = form.getBoundingClientRect();
-                            const all = document.querySelectorAll('*');
-                            for (const el of all) {
-                                if (form.contains(el)) continue;
-                                const style = window.getComputedStyle(el);
-                                if (style.position === 'fixed' || style.position === 'absolute') {
-                                    const elRect = el.getBoundingClientRect();
-                                    const overlaps = !(
-                                        elRect.right < rect.left ||
-                                        elRect.left > rect.right ||
-                                        elRect.bottom < rect.top ||
-                                        elRect.top > rect.bottom
-                                    );
-                                    if (overlaps && parseInt(style.zIndex || '0') > 0) {
-                                        el.style.display = 'none';
-                                    }
-                                }
+            # Strategy 3: Try scrolling into view (wrapped safely)
+            if not field_visible:
+                try:
+                    await username_input.scroll_into_view_if_needed(timeout=3000)
+                    await self._page.wait_for_timeout(500)
+                    await username_input.wait_for(state="visible", timeout=2000)
+                    field_visible = True
+                except Exception:
+                    logger.warning("scroll_into_view failed. Trying JS overlay removal...")
+
+            # Strategy 4: Remove blocking overlays via JS
+            if not field_visible:
+                await self._page.evaluate("""
+                    () => {
+                        // Remove ALL fixed/absolute/sticky overlays everywhere
+                        const all = document.querySelectorAll('*');
+                        for (const el of all) {
+                            const style = window.getComputedStyle(el);
+                            if (
+                                (style.position === 'fixed' || style.position === 'sticky') &&
+                                parseInt(style.zIndex || '0') > 0
+                            ) {
+                                el.remove();
                             }
                         }
-                    """)
-                    await self._page.wait_for_timeout(500)
+                        // Also force the login form and inputs to be visible
+                        const inputs = document.querySelectorAll(
+                            'input[id="username"], input[name="username"], '  +
+                            'input[autocomplete="username"]'
+                        );
+                        for (const inp of inputs) {
+                            inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;';
+                            // Walk up the DOM and unhide parent containers
+                            let parent = inp.parentElement;
+                            while (parent && parent !== document.body) {
+                                const ps = window.getComputedStyle(parent);
+                                if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') {
+                                    parent.style.cssText += 'display:block!important;visibility:visible!important;opacity:1!important;';
+                                }
+                                parent = parent.parentElement;
+                            }
+                        }
+                    }
+                """)
+                await self._page.wait_for_timeout(1000)
+                try:
                     await username_input.wait_for(state="visible", timeout=5000)
+                    field_visible = True
+                except Exception:
+                    logger.warning("JS overlay removal didn't help either.")
+
+            # Strategy 5: Force-fill via JS if the element exists but won't become visible
+            if not field_visible:
+                logger.warning("All visibility strategies failed. Attempting JS force-fill...")
+                exists = await username_input.count()
+                if exists == 0:
+                    raise RuntimeError("Username input element not found in DOM at all.")
+
+                # Use JS to directly set value and dispatch events
+                await self._page.evaluate("""
+                    (username) => {
+                        const inp = document.querySelector(
+                            'input[id="username"], input[name="username"], ' +
+                            'input[autocomplete="username"]'
+                        );
+                        if (!inp) throw new Error('No username input in DOM');
+                        const nativeSet = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ).set;
+                        nativeSet.call(inp, username);
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                """, self.config.username)
+                logger.info("Username filled via JS force-fill.")
+
+                # Now handle password the same way
+                await self._page.evaluate("""
+                    (password) => {
+                        const inp = document.querySelector(
+                            'input[id="password"], input[name="password"], ' +
+                            'input[type="password"]'
+                        );
+                        if (!inp) throw new Error('No password input in DOM');
+                        inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;';
+                        const nativeSet = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ).set;
+                        nativeSet.call(inp, password);
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                """, self.config.password)
+                logger.info("Password filled via JS force-fill.")
+
+                # Click submit via JS
+                await self._page.evaluate("""
+                    () => {
+                        const btn = document.querySelector(
+                            'button[id="login"], button[type="submit"]'
+                        );
+                        if (btn) btn.click();
+                    }
+                """)
+                logger.info("Login submitted via JS force-click.")
+
+                # Wait for redirect
+                await self._page.wait_for_url(
+                    lambda url: "/login" not in url,
+                    timeout=20000,
+                )
+                await self._page.wait_for_timeout(3000)
+
+                if await self._is_logged_in():
+                    logger.info("Login successful (JS force-fill): %s", self.config.username)
+                    await self._save_storage_state()
+                    return True
+                else:
+                    logger.error("Login failed even with JS force-fill.")
+                    return False
 
             # Type like a human (with delays between keystrokes)
             await username_input.click()
