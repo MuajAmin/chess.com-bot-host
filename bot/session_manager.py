@@ -258,19 +258,127 @@ class SessionManager:
 
         return await self._credential_login()
 
+    async def _dismiss_overlays(self):
+        """Dismiss cookie consent banners, GDPR modals, and other overlays."""
+        # Common cookie/consent button selectors across chess.com
+        overlay_selectors = [
+            # Cookie consent buttons
+            'button[id="onetrust-accept-btn-handler"]',
+            'button:has-text("Accept")',
+            'button:has-text("Accept All")',
+            'button:has-text("I Accept")',
+            'button:has-text("Got it")',
+            'button:has-text("OK")',
+            'button:has-text("Agree")',
+            'a:has-text("Accept")',
+            # Generic close/dismiss buttons on modals
+            '[class*="cookie"] button',
+            '[class*="consent"] button',
+            '[class*="banner"] button[class*="close"]',
+            '[class*="modal"] button[class*="close"]',
+            '[aria-label="Close"]',
+            '[aria-label="close"]',
+        ]
+
+        dismissed = False
+        for selector in overlay_selectors:
+            try:
+                btn = self._page.locator(selector).first
+                if await btn.is_visible(timeout=500):
+                    await btn.click()
+                    logger.info("Dismissed overlay: %s", selector)
+                    dismissed = True
+                    await self._page.wait_for_timeout(500)
+                    break
+            except Exception:
+                continue
+
+        if not dismissed:
+            # Nuclear option: remove all fixed/absolute overlays via JS
+            removed = await self._page.evaluate("""
+                () => {
+                    let removed = 0;
+                    const all = document.querySelectorAll('div, section, aside');
+                    for (const el of all) {
+                        const style = window.getComputedStyle(el);
+                        const isOverlay = (
+                            (style.position === 'fixed' || style.position === 'absolute') &&
+                            parseInt(style.zIndex || '0') > 999
+                        );
+                        if (isOverlay && el.offsetHeight > 100) {
+                            el.remove();
+                            removed++;
+                        }
+                    }
+                    return removed;
+                }
+            """)
+            if removed:
+                logger.info("Removed %d high-z-index overlay(s) via JS.", removed)
+
+        return dismissed
+
     async def _credential_login(self):
         """Login using username and password."""
         logger.info("Navigating to login page...")
         await self._page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-        await self._page.wait_for_timeout(2000)
+        await self._page.wait_for_timeout(3000)
 
         try:
-            # Fill username
+            # Step 1: Dismiss any cookie/consent overlays
+            await self._dismiss_overlays()
+            await self._page.wait_for_timeout(1000)
+
+            # Step 2: Find the username input
             username_input = self._page.locator(
                 'input[id="username"], input[name="username"], '
                 'input[autocomplete="username"]'
             )
-            await username_input.wait_for(state="visible", timeout=10000)
+
+            # Check if it's visible; if not, try scrolling to it or forcing visibility
+            try:
+                await username_input.wait_for(state="visible", timeout=5000)
+            except Exception:
+                logger.warning("Username field hidden. Attempting to force visibility...")
+                # Try scrolling into view
+                await username_input.scroll_into_view_if_needed(timeout=3000)
+                await self._page.wait_for_timeout(500)
+
+                # If still hidden, force visibility via JS
+                try:
+                    await username_input.wait_for(state="visible", timeout=2000)
+                except Exception:
+                    logger.warning("Still hidden. Removing blocking overlays via JS...")
+                    await self._page.evaluate("""
+                        () => {
+                            // Remove all elements covering the login form
+                            const form = document.querySelector('form') ||
+                                         document.querySelector('[class*="login"]');
+                            if (!form) return;
+
+                            const rect = form.getBoundingClientRect();
+                            const all = document.querySelectorAll('*');
+                            for (const el of all) {
+                                if (form.contains(el)) continue;
+                                const style = window.getComputedStyle(el);
+                                if (style.position === 'fixed' || style.position === 'absolute') {
+                                    const elRect = el.getBoundingClientRect();
+                                    const overlaps = !(
+                                        elRect.right < rect.left ||
+                                        elRect.left > rect.right ||
+                                        elRect.bottom < rect.top ||
+                                        elRect.top > rect.bottom
+                                    );
+                                    if (overlaps && parseInt(style.zIndex || '0') > 0) {
+                                        el.style.display = 'none';
+                                    }
+                                }
+                            }
+                        }
+                    """)
+                    await self._page.wait_for_timeout(500)
+                    await username_input.wait_for(state="visible", timeout=5000)
+
             # Type like a human (with delays between keystrokes)
             await username_input.click()
             await self._page.wait_for_timeout(200)
@@ -319,6 +427,17 @@ class SessionManager:
 
         except Exception as e:
             logger.error("Login failed: %s", e)
+            # Save debug screenshot
+            try:
+                screenshot_path = os.path.join(
+                    os.path.dirname(self.config.cookie_file) or ".",
+                    "logs", "login_debug.png"
+                )
+                os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
+                await self._page.screenshot(path=screenshot_path, full_page=True)
+                logger.error("Debug screenshot saved: %s", screenshot_path)
+            except Exception:
+                pass
             return False
 
     async def _is_logged_in(self):
