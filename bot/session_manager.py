@@ -330,10 +330,13 @@ class SessionManager:
             await self._page.wait_for_timeout(1000)
 
             # Step 2: Find the username input
+            # chess.com uses id="login-username" for the real login form;
+            # a secondary form may also have id="username", so be specific.
             username_input = self._page.locator(
+                'input[id="login-username"], '
                 'input[id="username"], input[name="username"], '
                 'input[autocomplete="username"]'
-            )
+            ).first
 
             # ── Make the username field visible (cascade of strategies) ──
             field_visible = False
@@ -382,8 +385,8 @@ class SessionManager:
                         }
                         // Also force the login form and inputs to be visible
                         const inputs = document.querySelectorAll(
-                            'input[id="username"], input[name="username"], '  +
-                            'input[autocomplete="username"]'
+                            'input[id="login-username"], input[id="username"], '
+                            + 'input[name="username"], input[autocomplete="username"]'
                         );
                         for (const inp of inputs) {
                             inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;';
@@ -417,8 +420,10 @@ class SessionManager:
                 await self._page.evaluate("""
                     (username) => {
                         const inp = document.querySelector(
-                            'input[id="username"], input[name="username"], ' +
-                            'input[autocomplete="username"]'
+                            'input[id="login-username"]'
+                        ) || document.querySelector(
+                            'input[id="username"], input[name="username"], '
+                            + 'input[autocomplete="username"]'
                         );
                         if (!inp) throw new Error('No username input in DOM');
                         const nativeSet = Object.getOwnPropertyDescriptor(
@@ -435,8 +440,10 @@ class SessionManager:
                 await self._page.evaluate("""
                     (password) => {
                         const inp = document.querySelector(
-                            'input[id="password"], input[name="password"], ' +
-                            'input[type="password"]'
+                            'input[id="login-password"]'
+                        ) || document.querySelector(
+                            'input[id="password"], input[name="password"], '
+                            + 'input[type="password"]'
                         );
                         if (!inp) throw new Error('No password input in DOM');
                         inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;';
@@ -454,7 +461,8 @@ class SessionManager:
                 await self._page.evaluate("""
                     () => {
                         const btn = document.querySelector(
-                            'button[id="login"], button[type="submit"]'
+                            'button[id="login"], '
+                            + 'form button[type="submit"], button[type="submit"]'
                         );
                         if (btn) btn.click();
                     }
@@ -486,9 +494,10 @@ class SessionManager:
 
             # Fill password
             password_input = self._page.locator(
+                'input[id="login-password"], '
                 'input[id="password"], input[name="password"], '
                 'input[type="password"]'
-            )
+            ).first
             await password_input.wait_for(state="visible", timeout=10000)
             await password_input.click()
             await self._page.wait_for_timeout(200)
@@ -501,7 +510,7 @@ class SessionManager:
             login_button = self._page.locator(
                 'button[id="login"], button[type="submit"], '
                 'button:has-text("Log In"), button:has-text("Sign In")'
-            )
+            ).first
             await login_button.wait_for(state="visible", timeout=10000)
             await self._page.wait_for_timeout(500)
             await login_button.click()
