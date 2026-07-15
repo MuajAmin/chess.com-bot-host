@@ -551,6 +551,32 @@ class SessionManager:
                 if error_text:
                     logger.error("Login page error message(s): %s", error_text)
 
+                # Check for CAPTCHA
+                has_captcha = await self._page.evaluate("""
+                    () => {
+                        const iframes = document.querySelectorAll('iframe');
+                        for (const f of iframes) {
+                            const src = (f.src || '').toLowerCase();
+                            if (src.includes('recaptcha') || src.includes('hcaptcha') ||
+                                src.includes('turnstile') || src.includes('captcha')) {
+                                return true;
+                            }
+                        }
+                        const divs = document.querySelectorAll(
+                            '[class*="captcha"], [id*="captcha"], ' +
+                            '[class*="recaptcha"], [id*="recaptcha"]'
+                        );
+                        return divs.length > 0;
+                    }
+                """)
+                if has_captcha:
+                    logger.error(
+                        "🔒 CAPTCHA detected on login page! "
+                        "Automated login is blocked. "
+                        "Use login_helper.py on your local machine to login manually, "
+                        "then upload session_cookies.json to the VPS."
+                    )
+
             await self._page.wait_for_timeout(2000)
 
             if await self._is_logged_in():
