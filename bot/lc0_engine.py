@@ -7,6 +7,7 @@ which gives instant human-like moves with near-zero CPU load.
 """
 
 import logging
+import asyncio
 import chess
 import chess.engine
 
@@ -179,8 +180,14 @@ class Lc0Engine:
         """Stop the engine and free resources."""
         if self._engine:
             try:
-                await self._engine.quit()
+                await asyncio.wait_for(self._engine.quit(), timeout=5)
                 logger.info("Lc0 engine stopped.")
+            except asyncio.TimeoutError:
+                logger.warning("Timed out waiting for Lc0 to quit; killing engine transport.")
+                try:
+                    self._engine.transport.kill()
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("Error stopping engine: %s", e)
             finally:

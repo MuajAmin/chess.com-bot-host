@@ -22,7 +22,7 @@ engine:
   weights: "/home/bot/weights/maia-1900.pb.gz"
   backend: "blas"
   threads: 1
-  nn_cache_size: 200000
+  nn_cache_size: 10000
   time_per_move: 1.5         # seconds — only used for non-Maia weights
   # Maia weights auto-detected: uses nodes=1 (instant, zero CPU spike)
 
@@ -40,7 +40,7 @@ notifications:
                               # Discord: https://discord.com/api/webhooks/<ID>/<TOKEN>
 
 server:
-  check_interval: 1          # seconds between challenge checks
+  check_interval: 3          # seconds between challenge checks
   max_games_per_day: 5       # daily game limit to avoid suspicion
   cookie_file: "session_cookies.json"
   headless: true             # false for debugging (shows browser)
@@ -48,3 +48,6 @@ server:
   max_context_games: 3       # recreate browser context every N games (memory leak fix)
   worker_timeout_seconds: 7200  # kill a stuck game worker after this many seconds
   browser_no_sandbox: false  # keep false; only true if Chromium sandbox is unavailable
+  blocked_resource_types: ["image", "media", "font"]
+  challenge_broad_scan_interval: 5
+  memory_log_interval_games: 1

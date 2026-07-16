@@ -20,6 +20,15 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 logger = logging.getLogger(__name__)
 
+_BLOCKED_URL_PARTS = (
+    "doubleclick.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googlesyndication.com",
+    "adservice.google.",
+    "facebook.net/tr",
+)
+
 # JavaScript to inject for stealth — hides headless browser indicators
 STEALTH_SCRIPTS = """
 // Override navigator.webdriver
@@ -87,6 +96,7 @@ class SessionManager:
         self._ws_endpoint = None  # CDP endpoint for subprocess sharing
         self._cdp_port = None
         self.MAX_CONTEXT_AGE = config.max_context_games if hasattr(config, 'max_context_games') else 3
+        self._blocked_resource_types = set(getattr(config, "blocked_resource_types", set()))
 
     @property
     def page(self) -> Page:
@@ -171,15 +181,23 @@ class SessionManager:
             "--disable-gpu",
             "--disable-extensions",
             "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-domain-reliability",
             "--disable-default-apps",
             "--disable-sync",
             "--disable-translate",
+            "--disable-notifications",
+            "--disable-client-side-phishing-detection",
             "--no-first-run",
+            "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled",  # Hide automation
             "--disable-infobars",
-            "--single-process",              # Reduce memory
-            "--disable-features=site-per-process",  # Reduce memory
-            "--js-flags=--max-old-space-size=256",   # Limit V8 heap
+            "--disable-site-isolation-trials",
+            "--disable-features=site-per-process,Translate,BackForwardCache,MediaRouter,OptimizationHints",
+            "--renderer-process-limit=2",
+            "--mute-audio",
+            "--hide-scrollbars",
+            "--js-flags=--max-old-space-size=192",   # Limit V8 heap
             "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={self._cdp_port}",
         ]
@@ -204,6 +222,21 @@ class SessionManager:
 
         await self._create_context()
         logger.info("Browser launched with stealth configuration.")
+
+    async def _route_request(self, route):
+        """Abort bulky or nonessential requests before Chromium allocates memory for them."""
+        request = route.request
+        url = request.url.lower()
+        try:
+            if (
+                request.resource_type in self._blocked_resource_types or
+                any(part in url for part in _BLOCKED_URL_PARTS)
+            ):
+                await route.abort()
+                return
+            await route.continue_()
+        except Exception as e:
+            logger.debug("Request route handling failed for %s: %s", request.url, e)
 
     async def _create_context(self):
         """Create a new browser context with stealth and optional cookie restore."""
@@ -240,8 +273,12 @@ class SessionManager:
 
         # Inject stealth scripts into every new page
         await self._context.add_init_script(STEALTH_SCRIPTS)
+        if self._blocked_resource_types:
+            await self._context.route("**/*", self._route_request)
 
         self._page = await self._context.new_page()
+        self._page.set_default_timeout(5000)
+        self._page.set_default_navigation_timeout(20000)
         self._context_age = 0
         logger.debug("New browser context created with stealth scripts.")
 

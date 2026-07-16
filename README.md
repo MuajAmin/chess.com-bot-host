@@ -61,7 +61,7 @@ engine:
   weights: "/home/bot/weights/maia-1900.pb.gz"
   backend: "blas"
   threads: 1
-  nn_cache_size: 200000
+  nn_cache_size: 10000
   time_per_move: 1.5           # Only used if type is "lc0"
 
 humanizer:
@@ -76,7 +76,7 @@ notifications:
   webhook_url: ""              # Telegram or Discord webhook endpoint URL
 
 server:
-  check_interval: 12           # Seconds between challenge checks
+  check_interval: 3            # Seconds between challenge checks
   max_games_per_day: 5         # Daily limit to avoid suspicion
   cookie_file: "session_cookies.json"
   headless: true               # Set to false to watch browser actions
@@ -84,6 +84,9 @@ server:
   max_context_games: 3         # Recreate browser context every N games
   worker_timeout_seconds: 7200 # Kill a stuck game worker after this many seconds
   browser_no_sandbox: false    # Keep false unless Chromium sandbox is unavailable
+  blocked_resource_types: ["image", "media", "font"]
+  challenge_broad_scan_interval: 5
+  memory_log_interval_games: 1
 ```
 
 ### Key Parameter Details
@@ -96,6 +99,9 @@ server:
 | **server** | `max_context_games`| `3` | Periodically refreshes the browser window to flush cached assets and prevent Chromium memory growth. |
 | **server** | `worker_timeout_seconds` | `7200` | Prevents a stuck worker subprocess from blocking the main listener forever. |
 | **server** | `browser_no_sandbox` | `false` | Enables Chromium `--no-sandbox` only when explicitly required. Do not use it while running as root. |
+| **server** | `blocked_resource_types` | `["image", "media", "font"]` | Blocks bulky browser resources that are not needed for DOM parsing or clicking moves. |
+| **server** | `challenge_broad_scan_interval` | `5` | Runs the expensive full-DOM challenge scan every N checks while cheap targeted scans still run every check. |
+| **server** | `memory_log_interval_games` | `1` | Logs process RSS/high-water memory after game cleanup to catch memory growth over long runs. |
 
 ---
 

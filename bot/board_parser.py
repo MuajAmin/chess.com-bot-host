@@ -56,6 +56,7 @@ class BoardParser:
         self._our_color = None
         self._last_fen = None
         self._last_board = None  # Cache full Board object from move replay
+        self._last_clean_moves = ()
         self._move_count = 0
         self._strategy_used = None
 
@@ -120,6 +121,10 @@ class BoardParser:
             self._last_fen = board.fen()
             return board.fen()
 
+        return await self._get_board_fen_without_replay()
+
+    async def _get_board_fen_without_replay(self):
+        """Run only non-replay FEN strategies."""
         # Strategy 2: Internal JS game state
         fen = await self._parse_from_js_state()
         if fen:
@@ -218,35 +223,54 @@ class BoardParser:
 
             raw_moves = move_data["moves"]
             source = move_data["source"]
+            clean_moves = tuple(
+                san for san in (self._clean_san(raw) for raw in raw_moves)
+                if san
+            )
+            if not clean_moves:
+                return None
+
+            if self._last_board is not None and clean_moves == self._last_clean_moves:
+                return self._last_board
+
             logger.debug(
                 "Move list replay: found %d moves (source: %s)",
-                len(raw_moves), source,
+                len(clean_moves), source,
             )
 
-            # Replay moves on a fresh board
-            board = chess.Board()
-            for i, raw_san in enumerate(raw_moves):
-                san = self._clean_san(raw_san)
-                if not san:
-                    continue
+            if (
+                self._last_board is not None and
+                self._last_clean_moves and
+                clean_moves[:len(self._last_clean_moves)] == self._last_clean_moves
+            ):
+                board = self._last_board.copy(stack=True)
+                start_index = len(self._last_clean_moves)
+            else:
+                board = chess.Board()
+                start_index = 0
+
+            for i, san in enumerate(clean_moves[start_index:], start=start_index):
                 try:
                     board.push_san(san)
                 except (chess.IllegalMoveError, chess.InvalidMoveError,
                         chess.AmbiguousMoveError) as e:
                     logger.warning(
-                        "Move replay: invalid move '%s' (cleaned: '%s') at index %d: %s",
-                        raw_san, san, i, e,
+                        "Move replay: invalid move '%s' at index %d: %s",
+                        san, i, e,
                     )
                     # If we fail mid-replay, return what we have so far
                     # (better than nothing — at least castling rights are partially correct)
                     if board.move_stack:
                         logger.info(
                             "Move replay: partial replay (%d/%d moves applied)",
-                            len(board.move_stack), len(raw_moves),
+                            len(board.move_stack), len(clean_moves),
                         )
                         return board
                     return None
 
+            self._last_board = board
+            self._last_clean_moves = clean_moves
+            self._move_count = len(clean_moves)
             logger.debug(
                 "Move replay: full board reconstructed (%d moves, FEN: %s)",
                 len(board.move_stack), board.fen()[:50],
@@ -607,8 +631,8 @@ class BoardParser:
             self._last_fen = board.fen()
             return board
 
-        # Fallback to FEN-based parsing
-        fen = await self.get_board_fen()
+        # Fallback to FEN-based parsing without retrying move replay.
+        fen = await self._get_board_fen_without_replay()
         if fen is None:
             return None
 

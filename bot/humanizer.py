@@ -53,7 +53,7 @@ def _count_hanging_pieces(board):
     return hanging
 
 
-def _is_simple_recapture(board):
+def _is_simple_recapture(board, legal_moves=None):
     """
     Check if the position likely calls for a simple recapture.
     (Last move was a capture and there's an obvious retake.)
@@ -66,10 +66,24 @@ def _is_simple_recapture(board):
     if board.is_capture(last_move):
         # Check if we can recapture on that square
         to_square = last_move.to_square
-        for move in board.legal_moves:
+        moves = legal_moves if legal_moves is not None else board.legal_moves
+        for move in moves:
             if move.to_square == to_square and board.is_capture(move):
                 return True
     return False
+
+
+def build_position_metrics(board):
+    """Compute expensive per-position values once and reuse them."""
+    legal_moves = tuple(board.legal_moves)
+    return {
+        "legal_moves": legal_moves,
+        "legal_move_count": len(legal_moves),
+        "hanging": _count_hanging_pieces(board),
+        "piece_count": len(board.piece_map()),
+        "in_check": board.is_check(),
+        "simple_recapture": _is_simple_recapture(board, legal_moves),
+    }
 
 
 class Humanizer:
@@ -128,7 +142,7 @@ class Humanizer:
         self._our_time = our_time
         self._opp_time = opp_time
 
-    async def apply_delay(self, board):
+    async def apply_delay(self, board, metrics=None):
         """
         Wait a human-like amount of time before making a move.
         Uses Gaussian distribution scaled by position characteristics.
@@ -137,16 +151,18 @@ class Humanizer:
             return
 
         self._move_number += 1
+        if metrics is None:
+            metrics = build_position_metrics(board)
 
         # Premove simulation — obvious recaptures or forced moves
-        if self._should_premove(board):
+        if self._should_premove(board, metrics):
             delay = random.uniform(0.05, 0.2)
             logger.debug("PREMOVE delay: %.2fs (move #%d)", delay, self._move_number)
             await asyncio.sleep(delay)
             return
 
         # Calculate position-aware delay
-        delay = self._calculate_delay(board)
+        delay = self._calculate_delay(board, metrics)
         self._total_think_time += delay
 
         logger.debug(
@@ -155,21 +171,22 @@ class Humanizer:
         )
         await asyncio.sleep(delay)
 
-    def _should_premove(self, board):
+    def _should_premove(self, board, metrics=None):
         """Decide if this should be a premove (near-instant response)."""
         # Forced move (only 1 legal move) — humans premove these
-        legal_moves = list(board.legal_moves)
-        if len(legal_moves) == 1:
+        if metrics is None:
+            metrics = build_position_metrics(board)
+        if metrics["legal_move_count"] == 1:
             return random.random() < 0.7  # 70% chance of premove for forced moves
 
         # Simple recapture — humans often premove these
-        if _is_simple_recapture(board):
+        if metrics["simple_recapture"]:
             return random.random() < self.config.humanizer_premove_chance * 3
 
         # Random premove chance (rare)
         return random.random() < self.config.humanizer_premove_chance
 
-    def _calculate_delay(self, board):
+    def _calculate_delay(self, board, metrics=None):
         """
         Calculate delay using Gaussian distribution with position-aware scaling.
 
@@ -178,9 +195,11 @@ class Humanizer:
         - Position complexity (legal moves, hanging pieces)
         - Check status
         """
-        legal_moves = len(list(board.legal_moves))
-        hanging = _count_hanging_pieces(board)
-        piece_count = len(board.piece_map())
+        if metrics is None:
+            metrics = build_position_metrics(board)
+        legal_moves = metrics["legal_move_count"]
+        hanging = metrics["hanging"]
+        piece_count = metrics["piece_count"]
 
         # --- Determine base delay center and sigma ---
 
@@ -229,7 +248,7 @@ class Humanizer:
             center *= 1.2
 
         # In check — usually quick response
-        if board.is_check():
+        if metrics["in_check"]:
             if random.random() < 0.5:
                 center *= 0.4  # Quick escape
             else:
@@ -244,7 +263,7 @@ class Humanizer:
 
         return delay
 
-    def should_blunder(self, board=None):
+    def should_blunder(self, board=None, metrics=None):
         """
         Decide if the bot should play a suboptimal move.
         Blunder rate scales with position complexity (humans blunder
@@ -260,9 +279,11 @@ class Humanizer:
         base_chance = self.config.humanizer_blunder_chance
 
         if board:
-            hanging = _count_hanging_pieces(board)
-            legal_moves = len(list(board.legal_moves))
-            piece_count = len(board.piece_map())
+            if metrics is None:
+                metrics = build_position_metrics(board)
+            hanging = metrics["hanging"]
+            legal_moves = metrics["legal_move_count"]
+            piece_count = metrics["piece_count"]
 
             # Complex tactical positions — humans blunder more
             if hanging >= 2:
@@ -293,7 +314,7 @@ class Humanizer:
             logger.info(
                 "BLUNDER triggered (roll=%.3f < chance=%.3f, move #%d, hanging=%d)",
                 roll, base_chance, self._move_number,
-                _count_hanging_pieces(board) if board else 0,
+                metrics["hanging"] if metrics else 0,
             )
             return True
         return False
@@ -322,7 +343,7 @@ class Humanizer:
         )
         return move
 
-    def get_engine_time_adjustment(self, board):
+    def get_engine_time_adjustment(self, board, metrics=None):
         """
         Adjust engine thinking time based on position complexity.
 
@@ -332,7 +353,9 @@ class Humanizer:
         if not self.config.humanizer_enabled:
             return 1.0
 
-        legal_moves = len(list(board.legal_moves))
+        if metrics is None:
+            metrics = build_position_metrics(board)
+        legal_moves = metrics["legal_move_count"]
 
         if legal_moves <= 3:
             return 0.3   # Forced — minimal think

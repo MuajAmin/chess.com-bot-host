@@ -7,6 +7,7 @@ IMPORTANT: chess.com challenge notifications use ICON buttons (✓ ✗),
 not text buttons. The detection must account for this.
 """
 
+import asyncio
 import logging
 import re
 from urllib.parse import unquote
@@ -33,6 +34,12 @@ class ChallengeListener:
         self.config = config
         self.page = page
         self._debug_dump_count = 0
+        self._broad_scan_interval = max(
+            1,
+            int(getattr(config, "challenge_broad_scan_interval", 5)),
+        )
+        self._checks_since_broad_scan = self._broad_scan_interval
+        self._allowed_users_lc = {u.lower() for u in getattr(config, "allowed_users", [])}
 
     async def check_and_accept(self):
         """
@@ -101,8 +108,13 @@ class ChallengeListener:
             # with specific structure. We look for elements that:
             # - Contain "Challenge" text (as in "10 min · Challenge")
             # - Have accept/decline icon buttons nearby
+            self._checks_since_broad_scan += 1
+            allow_broad_scan = self._checks_since_broad_scan >= self._broad_scan_interval
+            if allow_broad_scan:
+                self._checks_since_broad_scan = 0
+
             challenge_info = await self.page.evaluate(r"""
-                (markerAttr) => {
+                ({ markerAttr, allowBroadScan }) => {
                     const clickableSelector =
                         'button, [role="button"], a[href], a[class*="btn"], [class*="icon"]';
 
@@ -265,23 +277,25 @@ class ChallengeListener:
                     }
 
                     // Strategy 1: Look for challenge text with nearby action controls.
-                    for (const el of document.querySelectorAll('*')) {
-                        if (!isVisible(el)) continue;
+                    if (allowBroadScan) {
+                        for (const el of document.querySelectorAll('*')) {
+                            if (!isVisible(el)) continue;
 
-                        const rect = el.getBoundingClientRect();
-                        if (rect.height > 250 || rect.width > 900) continue;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height > 250 || rect.width > 900) continue;
 
-                        const text = (el.textContent || '').trim();
-                        if (!looksLikeChallengeText(text)) continue;
+                            const text = (el.textContent || '').trim();
+                            if (!looksLikeChallengeText(text)) continue;
 
-                        let container = el;
-                        for (let i = 0; i < 5; i++) {
-                            if (!container.parentElement) break;
-                            container = container.parentElement;
+                            let container = el;
+                            for (let i = 0; i < 5; i++) {
+                                if (!container.parentElement) break;
+                                container = container.parentElement;
 
-                            const buttons = container.querySelectorAll(clickableSelector);
-                            if (buttons.length >= 2 && isVisible(container)) {
-                                return buildInfo(container, 'text_scan', text);
+                                const buttons = container.querySelectorAll(clickableSelector);
+                                if (buttons.length >= 2 && isVisible(container)) {
+                                    return buildInfo(container, 'text_scan', text);
+                                }
                             }
                         }
                     }
@@ -306,7 +320,10 @@ class ChallengeListener:
 
                     return { found: false };
                 }
-            """, _CHALLENGE_MARKER_ATTR)
+            """, {
+                "markerAttr": _CHALLENGE_MARKER_ATTR,
+                "allowBroadScan": allow_broad_scan,
+            })
 
             if challenge_info and challenge_info.get("found"):
                 method = challenge_info.get("method", "unknown")
@@ -495,10 +512,9 @@ class ChallengeListener:
             return True
 
         if self.config.challenge_mode == "whitelist":
-            allowed = [u.lower() for u in self.config.allowed_users]
-            if "*" in allowed:
+            if "*" in self._allowed_users_lc:
                 return True
-            return challenger_name.lower() in allowed
+            return challenger_name.lower() in self._allowed_users_lc
 
         logger.warning("Unknown challenge mode: %s", self.config.challenge_mode)
         return False
@@ -769,48 +785,32 @@ class ChallengeListener:
             True if we're on a real game page
         """
         try:
-            # Wait a moment for navigation
-            await self.page.wait_for_timeout(2000)
+            deadline = asyncio.get_running_loop().time() + (_GAME_VERIFY_TIMEOUT_MS / 1000)
+            while asyncio.get_running_loop().time() < deadline:
+                url = self.page.url
+                if "/game/live/" in url or "/game/daily/" in url or "/play/game/" in url:
+                    logger.debug("Post-accept URL: %s", url)
+                    return True
 
-            url = self.page.url
-            logger.debug("Post-accept URL: %s", url)
+                has_game_board = await self.page.evaluate("""
+                    () => {
+                        const board = document.querySelector(
+                            'wc-chess-board, chess-board, [class*="board"]'
+                        );
+                        if (!board) return false;
+                        return !!document.querySelector(
+                            '[class*="clock"], [class*="timer"], [class*="time-component"], ' +
+                            '[class*="resign"], [class*="draw"], [class*="abort"]'
+                        );
+                    }
+                """)
+                if has_game_board:
+                    logger.info("Game board with clock/controls detected on page")
+                    return True
 
-            # Chess.com game pages have specific URL patterns
-            if "/game/live/" in url or "/game/daily/" in url or "/play/game/" in url:
-                return True
+                await asyncio.sleep(_GAME_VERIFY_POLL_MS / 1000)
 
-            # Check if a chess board is present AND we're on a game page
-            has_game_board = await self.page.evaluate("""
-                () => {
-                    // Check for live game board (not puzzle or home page board)
-                    const board = document.querySelector('wc-chess-board, chess-board, [class*="board"]');
-                    if (!board) return false;
-
-                    // Check for game clock (present in live games)
-                    const clock = document.querySelector(
-                        '[class*="clock"], [class*="timer"], [class*="time-component"]'
-                    );
-
-                    // Check for resign/draw buttons (present in active games)
-                    const gameControls = document.querySelector(
-                        '[class*="resign"], [class*="draw"], [class*="abort"]'
-                    );
-
-                    return !!(clock || gameControls);
-                }
-            """)
-
-            if has_game_board:
-                logger.info("Game board with clock/controls detected on page")
-                return True
-
-            # Wait a bit more and check URL again
-            await self.page.wait_for_timeout(3000)
-            url = self.page.url
-            if "/game/live/" in url or "/game/daily/" in url or "/play/game/" in url:
-                return True
-
-            logger.warning("Not on a game page. URL: %s", url)
+            logger.warning("Not on a game page. URL: %s", self.page.url)
             return False
 
         except Exception as e:

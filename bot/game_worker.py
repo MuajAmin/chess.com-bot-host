@@ -26,7 +26,7 @@ from playwright.async_api import async_playwright
 from bot.config import Config
 from bot.board_parser import BoardParser
 from bot.lc0_engine import Lc0Engine
-from bot.humanizer import Humanizer
+from bot.humanizer import Humanizer, build_position_metrics
 from bot.move_maker import MoveMaker
 from bot.game_tracker import GameTracker
 
@@ -100,7 +100,8 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 await asyncio.sleep(1)
                 continue
 
-            if not list(board.legal_moves):
+            metrics = build_position_metrics(board)
+            if metrics["legal_move_count"] == 0:
                 logger.info("No legal moves available.")
                 await asyncio.sleep(2)
                 continue
@@ -108,8 +109,8 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
             consecutive_errors = 0
 
             # Decide: blunder or best move?
-            if humanizer.should_blunder(board):
-                time_adj = humanizer.get_engine_time_adjustment(board)
+            if humanizer.should_blunder(board, metrics):
+                time_adj = humanizer.get_engine_time_adjustment(board, metrics)
                 top_moves = await engine.get_top_moves(
                     board, count=3,
                     time_limit=config.engine_time_per_move * time_adj,
@@ -119,7 +120,7 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 else:
                     move = await engine.get_best_move(board)
             else:
-                time_adj = humanizer.get_engine_time_adjustment(board)
+                time_adj = humanizer.get_engine_time_adjustment(board, metrics)
                 move = await engine.get_best_move(
                     board,
                     time_limit=config.engine_time_per_move * time_adj,
@@ -132,7 +133,7 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 continue
 
             # Apply human-like delay (clock-aware Gaussian distribution)
-            await humanizer.apply_delay(board)
+            await humanizer.apply_delay(board, metrics)
 
             # Make the move with Bézier mouse movement
             success = await move_maker.make_move(move)

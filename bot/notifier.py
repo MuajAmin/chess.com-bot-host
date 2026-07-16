@@ -12,7 +12,6 @@ Silently disabled when webhook_url is not configured.
 """
 
 import logging
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +38,7 @@ class Notifier:
         self._username = config.username
         self._is_telegram = "api.telegram.org" in self._webhook_url if self._webhook_url else False
         self._is_discord = "discord.com/api/webhooks" in self._webhook_url if self._webhook_url else False
+        self._client = httpx.AsyncClient(timeout=10.0) if self._enabled else None
 
         if self._enabled:
             logger.info(
@@ -64,47 +64,52 @@ class Notifier:
             return
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                if self._is_telegram:
-                    # Telegram Bot API: extract chat_id from URL or use as-is
-                    # Expected URL: https://api.telegram.org/bot<TOKEN>/sendMessage
-                    payload = {
-                        "text": message,
-                        "parse_mode": "HTML",
-                    }
-                    # If URL already has chat_id param, use it
-                    if "chat_id=" not in self._webhook_url:
-                        logger.warning("Telegram webhook: chat_id not in URL. Include ?chat_id=YOUR_CHAT_ID")
-                        return
-                    response = await client.post(self._webhook_url, json=payload)
+            if self._is_telegram:
+                # Telegram Bot API: extract chat_id from URL or use as-is
+                # Expected URL: https://api.telegram.org/bot<TOKEN>/sendMessage
+                payload = {
+                    "text": message,
+                    "parse_mode": "HTML",
+                }
+                # If URL already has chat_id param, use it
+                if "chat_id=" not in self._webhook_url:
+                    logger.warning("Telegram webhook: chat_id not in URL. Include ?chat_id=YOUR_CHAT_ID")
+                    return
+                response = await self._client.post(self._webhook_url, json=payload)
 
-                elif self._is_discord:
-                    # Discord webhook: POST with content field
-                    payload = {"content": message}
-                    response = await client.post(self._webhook_url, json=payload)
+            elif self._is_discord:
+                # Discord webhook: POST with content field
+                payload = {"content": message}
+                response = await self._client.post(self._webhook_url, json=payload)
 
-                else:
-                    # Generic webhook: POST JSON with message field
-                    payload = {
-                        "message": message,
-                        "bot": self._username,
-                        "source": "chess.com-bot",
-                    }
-                    response = await client.post(self._webhook_url, json=payload)
+            else:
+                # Generic webhook: POST JSON with message field
+                payload = {
+                    "message": message,
+                    "bot": self._username,
+                    "source": "chess.com-bot",
+                }
+                response = await self._client.post(self._webhook_url, json=payload)
 
-                if response.status_code >= 400:
-                    logger.warning(
-                        "Webhook returned %d: %s",
-                        response.status_code, response.text[:200],
-                    )
-                else:
-                    logger.debug("Webhook notification sent (%d)", response.status_code)
+            if response.status_code >= 400:
+                logger.warning(
+                    "Webhook returned %d: %s",
+                    response.status_code, response.text[:200],
+                )
+            else:
+                logger.debug("Webhook notification sent (%d)", response.status_code)
 
         except httpx.TimeoutException:
             logger.warning("Webhook notification timed out")
         except Exception as e:
             # Never let notification failure crash the bot
             logger.warning("Webhook notification failed: %s", e)
+
+    async def close(self):
+        """Close the reusable HTTP client."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
     # --- Convenience methods for game lifecycle events ---
 

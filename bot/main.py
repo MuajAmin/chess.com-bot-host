@@ -31,7 +31,7 @@ from bot.session_manager import SessionManager
 from bot.challenge_listener import ChallengeListener
 from bot.board_parser import BoardParser
 from bot.lc0_engine import Lc0Engine
-from bot.humanizer import Humanizer
+from bot.humanizer import Humanizer, build_position_metrics
 from bot.move_maker import MoveMaker
 from bot.game_tracker import GameTracker
 from bot.notifier import Notifier
@@ -39,6 +39,44 @@ from bot.notifier import Notifier
 logger = logging.getLogger(__name__)
 
 WORKER_TIMEOUT_RETURN_CODE = 124
+
+
+def _read_process_memory_kb():
+    """Return current process memory stats without requiring psutil."""
+    status_path = f"/proc/{os.getpid()}/status"
+    try:
+        values = {}
+        with open(status_path, "r", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith(("VmRSS:", "VmHWM:")):
+                    key, value = line.split(":", 1)
+                    values[key] = int(value.strip().split()[0])
+        if values:
+            return values
+    except OSError:
+        pass
+
+    try:
+        import resource
+
+        max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return {"VmHWM": int(max_rss)}
+    except Exception:
+        return {}
+
+
+def log_memory_snapshot(label):
+    stats = _read_process_memory_kb()
+    if not stats:
+        return
+    rss = stats.get("VmRSS")
+    hwm = stats.get("VmHWM")
+    parts = []
+    if rss is not None:
+        parts.append(f"rss={rss / 1024:.1f}MB")
+    if hwm is not None:
+        parts.append(f"hwm={hwm / 1024:.1f}MB")
+    logger.info("Memory snapshot (%s): %s", label, ", ".join(parts))
 
 
 async def play_game_inprocess(session, config, board_parser, engine, humanizer, move_maker, game_tracker):
@@ -113,7 +151,8 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 await asyncio.sleep(1)
                 continue
 
-            if not list(board.legal_moves):
+            metrics = build_position_metrics(board)
+            if metrics["legal_move_count"] == 0:
                 logger.info("No legal moves available.")
                 await asyncio.sleep(2)
                 continue
@@ -121,8 +160,8 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
             consecutive_errors = 0
 
             # Decide: blunder or best move?
-            if humanizer.should_blunder(board):
-                time_adj = humanizer.get_engine_time_adjustment(board)
+            if humanizer.should_blunder(board, metrics):
+                time_adj = humanizer.get_engine_time_adjustment(board, metrics)
                 top_moves = await engine.get_top_moves(
                     board, count=3,
                     time_limit=config.engine_time_per_move * time_adj,
@@ -132,7 +171,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 else:
                     move = await engine.get_best_move(board)
             else:
-                time_adj = humanizer.get_engine_time_adjustment(board)
+                time_adj = humanizer.get_engine_time_adjustment(board, metrics)
                 move = await engine.get_best_move(
                     board,
                     time_limit=config.engine_time_per_move * time_adj,
@@ -145,7 +184,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 continue
 
             # Apply human-like delay (clock-aware Gaussian distribution)
-            await humanizer.apply_delay(board)
+            await humanizer.apply_delay(board, metrics)
 
             # Make the move with Bézier mouse movement
             success = await move_maker.make_move(move)
@@ -279,6 +318,7 @@ async def main():
             logger.error("Cookie login failed and login_mode='cookie_only'. Exiting.")
             await notifier.error("Cookie login failed. Manual intervention needed.")
             await session.close()
+            await notifier.close()
             sys.exit(1)
         logger.info("Logged in via cookies.")
     else:
@@ -287,6 +327,7 @@ async def main():
             logger.error("Failed to login. Exiting.")
             await notifier.error("Login failed. Check credentials.")
             await session.close()
+            await notifier.close()
             sys.exit(1)
 
     logger.info("Logged in. Entering listener mode...")
@@ -410,6 +451,8 @@ async def main():
                     "Cleanup complete. Games: %d/%d, RAM freed.",
                     game_tracker.games_today, config.max_games_per_day,
                 )
+                if game_tracker.games_today % config.memory_log_interval_games == 0:
+                    log_memory_snapshot("post-game cleanup")
 
                 # Pause between games (human behavior)
                 pause = 5 + __import__('random').uniform(0, 10)
@@ -427,6 +470,7 @@ async def main():
         await notifier.error(f"Fatal error: {e}")
     finally:
         await session.close()
+        await notifier.close()
         logger.info("Bot shutdown complete.")
 
 

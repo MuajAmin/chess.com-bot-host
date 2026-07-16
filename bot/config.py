@@ -27,7 +27,7 @@ DEFAULTS = {
         "weights": "",
         "backend": "blas",
         "threads": 1,
-        "nn_cache_size": 200000,
+        "nn_cache_size": 10000,
         "time_per_move": 1.5,
     },
     "humanizer": {
@@ -42,7 +42,7 @@ DEFAULTS = {
         "webhook_url": "",  # Telegram/Discord webhook URL (empty = disabled)
     },
     "server": {
-        "check_interval": 1,
+        "check_interval": 3,
         "max_games_per_day": 5,
         "cookie_file": "session_cookies.json",
         "headless": True,
@@ -50,6 +50,9 @@ DEFAULTS = {
         "max_context_games": 3,  # Recreate browser context every N games
         "worker_timeout_seconds": 7200,
         "browser_no_sandbox": False,
+        "blocked_resource_types": ["image", "media", "font"],
+        "challenge_broad_scan_interval": 5,
+        "memory_log_interval_games": 1,
     },
 }
 
@@ -107,6 +110,14 @@ class Config:
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
+
+    @staticmethod
+    def _as_positive_int(value, default):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
 
     def _validate(self):
         """Validate critical config values."""
@@ -268,6 +279,28 @@ class Config:
     @property
     def browser_no_sandbox(self):
         return self._as_bool(self._data["server"].get("browser_no_sandbox", False))
+
+    @property
+    def blocked_resource_types(self):
+        values = self._data["server"].get("blocked_resource_types", [])
+        if not isinstance(values, list):
+            return set()
+        allowed = {"image", "media", "font"}
+        return {str(value).lower() for value in values if str(value).lower() in allowed}
+
+    @property
+    def challenge_broad_scan_interval(self):
+        return self._as_positive_int(
+            self._data["server"].get("challenge_broad_scan_interval", 5),
+            5,
+        )
+
+    @property
+    def memory_log_interval_games(self):
+        return self._as_positive_int(
+            self._data["server"].get("memory_log_interval_games", 1),
+            1,
+        )
 
     # --- Notifications ---
     @property

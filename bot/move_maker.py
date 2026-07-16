@@ -125,6 +125,7 @@ class MoveMaker:
         # Track last mouse position for continuous movement
         self._last_mouse_x = None
         self._last_mouse_y = None
+        self._board_box = None
 
     def set_color(self, is_white):
         """Set which color we're playing (affects coordinate mapping)."""
@@ -202,12 +203,12 @@ class MoveMaker:
         """
         dist = math.hypot(end[0] - start[0], end[1] - start[1])
 
-        # More points for longer distances (smoother curve)
-        num_points = max(15, min(40, int(dist / 8)))
+        # Keep the path human-like, but cap protocol events for low-CPU VPS runs.
+        num_points = max(6, min(14, int(dist / 24)))
         path = _generate_bezier_path(start, end, num_points)
 
         # Base time for the full movement (longer distance = more time)
-        base_time_ms = random.uniform(80, 200) + dist * random.uniform(0.3, 0.6)
+        base_time_ms = random.uniform(45, 120) + dist * random.uniform(0.12, 0.25)
 
         for i, (px, py) in enumerate(path):
             await self.page.mouse.move(px, py)
@@ -251,26 +252,46 @@ class MoveMaker:
 
     async def _get_board_bbox(self):
         """Get the bounding box of the chess board element."""
-        try:
-            board_selectors = [
-                'wc-chess-board',
-                '.board',
-                'chess-board',
-                '#board-single',
-                '#board-layout-main',
-            ]
+        if self._board_box is not None:
+            return self._board_box
 
-            for selector in board_selectors:
-                el = self.page.locator(selector)
-                if await el.count() > 0:
-                    bbox = await el.first.bounding_box()
-                    if bbox and bbox['width'] > 100:
-                        logger.debug(
-                            "Board found (%s): x=%.0f y=%.0f w=%.0f h=%.0f",
-                            selector, bbox['x'], bbox['y'],
-                            bbox['width'], bbox['height'],
-                        )
-                        return bbox
+        try:
+            bbox = await self.page.evaluate("""
+                () => {
+                    const selectors = [
+                        'wc-chess-board',
+                        '.board',
+                        'chess-board',
+                        '#board-single',
+                        '#board-layout-main',
+                    ];
+                    for (const selector of selectors) {
+                        const el = document.querySelector(selector);
+                        if (!el) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 100 && rect.height > 100) {
+                            return {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                                selector,
+                            };
+                        }
+                    }
+                    return null;
+                }
+            """)
+
+            if bbox:
+                logger.debug(
+                    "Board found (%s): x=%.0f y=%.0f w=%.0f h=%.0f",
+                    bbox["selector"], bbox["x"], bbox["y"],
+                    bbox["width"], bbox["height"],
+                )
+                bbox.pop("selector", None)
+                self._board_box = bbox
+                return bbox
 
             logger.error("Board element not found with any selector!")
             return None
