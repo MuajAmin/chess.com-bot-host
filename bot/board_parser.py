@@ -658,7 +658,7 @@ class BoardParser:
                     let topActive = false;
 
                     for (const clock of clocks) {
-                        const cls = clock.className || '';
+                        const cls = (clock.className || '').toString();
                         const isActive = cls.includes('active') ||
                                         cls.includes('running') ||
                                         cls.includes('player-turn');
@@ -689,17 +689,46 @@ class BoardParser:
                 elif turn_data.get("topActive"):
                     return chess.BLACK if self._our_color == chess.WHITE else chess.WHITE
 
-            # Method 2: Count moves in the move list
-            move_count = await self.page.evaluate("""
+            # Method 2: Reuse SAN replay when possible. This is more reliable
+            # than counting raw move-list nodes, because chess.com may render
+            # placeholders or nested move elements.
+            board = await self._parse_from_move_replay()
+            if board is not None:
+                return board.turn
+
+            # Method 3: Count only text that looks like an actual move.
+            raw_moves = await self.page.evaluate("""
                 () => {
-                    const nodes = document.querySelectorAll(
-                        '[data-ply], .move-text-component, .move-node'
-                    );
-                    return nodes.length;
+                    const collect = (nodes) => {
+                        const moves = [];
+                        for (const node of nodes) {
+                            const text = (node.textContent || '').trim();
+                            if (text && text !== '...' && !/^\\d+\\.?$/.test(text)) {
+                                moves.push(text);
+                            }
+                        }
+                        return moves;
+                    };
+
+                    const plyNodes = document.querySelectorAll('[data-ply]');
+                    if (plyNodes.length > 0) {
+                        return collect(Array.from(plyNodes).sort(
+                            (a, b) => parseInt(a.getAttribute('data-ply')) -
+                                      parseInt(b.getAttribute('data-ply'))
+                        ));
+                    }
+
+                    return collect(document.querySelectorAll(
+                        '.move-text-component, .move-node, .move-text'
+                    ));
                 }
             """)
 
-            if move_count is not None:
+            if raw_moves is not None:
+                move_count = len([
+                    san for san in (self._clean_san(raw) for raw in raw_moves)
+                    if san
+                ])
                 return chess.WHITE if move_count % 2 == 0 else chess.BLACK
 
             return chess.WHITE

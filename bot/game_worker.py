@@ -32,6 +32,78 @@ from bot.game_tracker import GameTracker
 
 logger = logging.getLogger(__name__)
 
+GAME_URL_PARTS = ("/game/live/", "/game/daily/", "/play/game/")
+GAME_PAGE_WAIT_SECONDS = 15
+
+
+def _is_game_url(url):
+    return any(part in (url or "") for part in GAME_URL_PARTS)
+
+
+async def _page_has_game_board(page):
+    try:
+        return await page.evaluate("""
+            () => {
+                const board = document.querySelector(
+                    'wc-chess-board, chess-board, .board, #board-single'
+                );
+                if (!board) return false;
+
+                const rect = board.getBoundingClientRect();
+                if (rect.width < 100 || rect.height < 100) return false;
+
+                return !!document.querySelector(
+                    '[class*="clock"], [class*="timer"], [class*="time-component"], ' +
+                    '[class*="resign"], [class*="draw"], [class*="abort"]'
+                );
+            }
+        """)
+    except Exception as e:
+        message = str(e).lower()
+        if (
+            "execution context was destroyed" in message or
+            "navigation" in message or
+            "target closed" in message
+        ):
+            return False
+        logger.debug("Game page probe failed for %s: %s", page.url, e)
+        return False
+
+
+async def _select_game_page(browser):
+    """
+    Find the live game page after the main process accepts a challenge.
+
+    CDP can expose multiple pages, and page ordering is not guaranteed. The
+    worker must attach to the page that is actually showing the board.
+    """
+    deadline = asyncio.get_running_loop().time() + GAME_PAGE_WAIT_SECONDS
+    last_urls = []
+
+    while asyncio.get_running_loop().time() < deadline:
+        pages = [
+            page
+            for context in browser.contexts
+            for page in context.pages
+            if not page.is_closed()
+        ]
+        last_urls = [page.url for page in pages]
+
+        for page in pages:
+            if _is_game_url(page.url):
+                logger.info("Selected game page by URL: %s", page.url[:120])
+                return page
+
+        for page in pages:
+            if await _page_has_game_board(page):
+                logger.info("Selected game page by board probe: %s", page.url[:120])
+                return page
+
+        await asyncio.sleep(0.25)
+
+    logger.error("No active game page found via CDP. Pages seen: %s", last_urls)
+    return None
+
 
 async def play_game(page, config, board_parser, engine, humanizer, move_maker, game_tracker):
     """
@@ -192,12 +264,11 @@ async def worker_main():
             # Connect to existing browser — DO NOT launch a new one
             browser = await p.chromium.connect_over_cdp(cdp_url)
 
-            # Get the existing page from main process's context
-            if not browser.contexts or not browser.contexts[0].pages:
-                logger.error("No pages found in connected browser!")
+            # Get the active game page from the main process's browser.
+            page = await _select_game_page(browser)
+            if page is None:
                 sys.exit(1)
 
-            page = browser.contexts[0].pages[0]
             logger.info("Connected to page: %s", page.url[:80])
 
             # Initialize game components (all in THIS subprocess)

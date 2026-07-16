@@ -19,7 +19,7 @@ _MAX_DEBUG_DUMPS = 3
 _CHALLENGE_MARKER_ATTR = "data-bot-challenge-id"
 _NAVIGATION_SETTLE_MS = 500
 _POST_ACCEPT_SETTLE_MS = 250
-_GAME_VERIFY_TIMEOUT_MS = 8000
+_GAME_VERIFY_TIMEOUT_MS = 15000
 _GAME_VERIFY_POLL_MS = 250
 
 
@@ -792,18 +792,40 @@ class ChallengeListener:
                     logger.debug("Post-accept URL: %s", url)
                     return True
 
-                has_game_board = await self.page.evaluate("""
-                    () => {
-                        const board = document.querySelector(
-                            'wc-chess-board, chess-board, [class*="board"]'
-                        );
-                        if (!board) return false;
-                        return !!document.querySelector(
-                            '[class*="clock"], [class*="timer"], [class*="time-component"], ' +
-                            '[class*="resign"], [class*="draw"], [class*="abort"]'
-                        );
-                    }
-                """)
+                try:
+                    has_game_board = await self.page.evaluate("""
+                        () => {
+                            const board = document.querySelector(
+                                'wc-chess-board, chess-board, [class*="board"]'
+                            );
+                            if (!board) return false;
+                            return !!document.querySelector(
+                                '[class*="clock"], [class*="timer"], [class*="time-component"], ' +
+                                '[class*="resign"], [class*="draw"], [class*="abort"]'
+                            );
+                        }
+                    """)
+                except Exception as e:
+                    # A challenge accept normally triggers an SPA/full navigation. During
+                    # that handoff Playwright can lose the current execution context; keep
+                    # polling instead of treating the accepted challenge as failed.
+                    message = str(e).lower()
+                    if (
+                        "execution context was destroyed" in message or
+                        "navigation" in message or
+                        "target closed" in message
+                    ):
+                        try:
+                            await self.page.wait_for_load_state(
+                                "domcontentloaded",
+                                timeout=_GAME_VERIFY_POLL_MS,
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(_GAME_VERIFY_POLL_MS / 1000)
+                        continue
+                    raise
+
                 if has_game_board:
                     logger.info("Game board with clock/controls detected on page")
                     return True
