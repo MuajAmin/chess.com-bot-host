@@ -58,7 +58,7 @@ challenge:
 engine:
   type: "auto"                 # auto | maia | lc0
   path: "/usr/local/bin/lc0"
-  weights: "/home/bot/weights/maia-1900.pb.gz"
+  weights: "/home/bot/chess.com_bot_host/weights/maia-1900.pb.gz"
   backend: "blas"
   threads: 1
   nn_cache_size: 10000

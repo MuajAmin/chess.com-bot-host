@@ -19,7 +19,7 @@ engine:
                               # "maia" = Maia human-like weights (nodes=1)
                               # "lc0" = standard Lc0 weights (time-based search)
   path: "/usr/local/bin/lc0"
-  weights: "/home/bot/weights/maia-1900.pb.gz"
+  weights: "/home/bot/chess.com_bot_host/weights/maia-1900.pb.gz"
   backend: "blas"
   threads: 1
   nn_cache_size: 10000
