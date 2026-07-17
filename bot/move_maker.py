@@ -126,6 +126,7 @@ class MoveMaker:
         self._last_mouse_x = None
         self._last_mouse_y = None
         self._board_box = None
+        self.last_controller_result = None
 
     def set_color(self, is_white):
         """Set whether White is at the bottom of the visible board."""
@@ -216,6 +217,8 @@ class MoveMaker:
                 chess.KNIGHT: "n",
             }.get(move.promotion)
 
+        self.last_controller_result = None
+
         try:
             result = await self.page.evaluate(
                 """
@@ -295,6 +298,7 @@ class MoveMaker:
                 """,
                 {"from": from_name, "to": to_name, "promotion": promotion},
             )
+            self.last_controller_result = result
 
             if result and result.get("ok"):
                 logger.info(
@@ -311,6 +315,11 @@ class MoveMaker:
 
         except Exception as e:
             logger.warning("Controller move exception for %s%s: %s", from_name, to_name, e)
+            self.last_controller_result = {
+                "ok": False,
+                "reason": str(e),
+                "exception": True,
+            }
             return False
 
     async def _move_mouse_bezier(self, start, end):

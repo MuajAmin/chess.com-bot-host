@@ -127,6 +127,99 @@ class BoardParser:
             return "bottom" if self._our_color == self._board_orientation else "top"
         return None
 
+    def force_bot_color(self, bot_color, reason="manual override"):
+        """Force the bot color and keep board-side dependent consumers in sync."""
+        if bot_color not in ("white", "black"):
+            return False
+
+        previous = self._bot_color or self._color_name(self._our_color)
+        self._set_colors(bot_color=bot_color)
+
+        if self._board_orientation is not None:
+            self._bot_side = (
+                "bottom" if self._our_color == self._board_orientation else "top"
+            )
+
+        logger.warning(
+            "Switching bot color from %s to %s (%s). Board orientation: %s bottom; bot side: %s",
+            previous,
+            bot_color,
+            reason,
+            self._color_name(self._board_orientation),
+            self._bot_side or "unknown",
+        )
+        return True
+
+    async def recover_color_after_invalid_move(self, move, board=None, controller_result=None):
+        """
+        Recover from an invalid first move caused by a wrong color decision.
+
+        This deliberately does not flip color for every failed click. It reacts
+        when Chess.com's controller rejects the UCI move, or when the controller
+        accepts it but the board still does not change. Blind color flipping is
+        limited to the opening where a wrong initial color is the realistic
+        failure mode.
+        """
+        result = controller_result or {}
+        reason = (result.get("reason") or "").lower()
+        controller_ok_without_position_change = result.get("ok") is True
+        controller_rejected_as_illegal = "not in legal moves" in reason
+
+        if not controller_rejected_as_illegal and not controller_ok_without_position_change:
+            return False
+
+        current = self._bot_color or self._color_name(self._our_color)
+        if current not in ("white", "black"):
+            return False
+
+        move_uci = move.uci() if move else "unknown"
+        trusted_methods = {
+            "game.getOptions().isPlayerBlack",
+            "game.getOptions().playing-color",
+            "game.getPlayingAs()",
+        }
+
+        snapshot = await self._read_game_controller_snapshot()
+        if snapshot and snapshot.get("color") in ("white", "black"):
+            method = snapshot.get("colorMethod")
+            page_color = snapshot["color"]
+            if method in trusted_methods and page_color != current:
+                self._set_colors(
+                    bot_color=page_color,
+                    board_orientation=snapshot.get("orientation"),
+                    bot_side=snapshot.get("botSide"),
+                )
+                if self._board_orientation is not None and self._bot_side is None:
+                    self._bot_side = (
+                        "bottom" if self._our_color == self._board_orientation else "top"
+                    )
+                logger.warning(
+                    "Recovered bot color from controller after invalid move %s: %s -> %s",
+                    move_uci,
+                    current,
+                    page_color,
+                )
+                return True
+
+        if board is not None and (board.fullmove_number > 2 or self._move_count > 4):
+            logger.warning(
+                "Move %s failed after controller fallback, but not flipping color after opening. "
+                "Controller result: %s",
+                move_uci,
+                result,
+            )
+            return False
+
+        next_color = "black" if current == "white" else "white"
+        reason_text = (
+            result.get("reason") or
+            "controller accepted move but board position did not change"
+        )
+        return self.force_bot_color(
+            next_color,
+            f"failed opening move {move_uci}: {reason_text}",
+        )
+
     async def wait_for_board_ready(self, timeout_ms=15000):
         """Wait until the playable board is visible enough to parse and click."""
         try:

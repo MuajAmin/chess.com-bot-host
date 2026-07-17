@@ -291,6 +291,7 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 continue
 
             move_registered = await board_parser.wait_for_position_change(board.fen())
+            controller_result = None
             if not move_registered:
                 logger.warning(
                     "Clicked %s but board state did not advance within timeout; "
@@ -302,8 +303,25 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                         board.fen(),
                         timeout_sec=3.0,
                     )
+                controller_result = move_maker.last_controller_result
 
             if not move_registered:
+                if await board_parser.recover_color_after_invalid_move(
+                    move,
+                    board=board,
+                    controller_result=controller_result,
+                ):
+                    move_maker.set_color(board_parser.is_board_white_bottom)
+                    last_move_key = None
+                    repeat_move_count = 0
+                    consecutive_errors = 0
+                    logger.warning(
+                        "Recovered color after invalid move %s; re-reading board before next move.",
+                        move.uci(),
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+
                 logger.warning(
                     "Move %s still did not register after fallback; re-checking position.",
                     move.uci(),
