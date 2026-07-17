@@ -271,13 +271,18 @@ class BoardParser:
                             name === 'guest' ||
                             name === 'anonymous' ||
                             name === 'white' ||
-                            name === 'black'
+                            name === 'black' ||
+                            name === 'true' ||
+                            name === 'false' ||
+                            name === 'null' ||
+                            name === 'undefined'
                         );
                     }
 
                     function addUsernameCandidate(candidates, rawValue, source, score) {
                         const rawText = (rawValue || '').toString().trim();
                         if (!rawText || rawText.length > 120) return;
+                        const sourceText = (source || '').toString().toLowerCase();
 
                         let displayName = null;
                         const directMatch = rawText.match(/^@?([A-Za-z0-9_-]{3,25})$/);
@@ -293,6 +298,7 @@ class BoardParser:
 
                         const name = normalizeName(displayName);
                         if (!name || isGenericUsername(name)) return;
+                        if (/^\\d+$/.test(name) && sourceText.includes('storage')) return;
                         candidates.push({ name, displayName, source, score });
                     }
 
@@ -316,9 +322,6 @@ class BoardParser:
                             addUsernameCandidate(candidates, match[1], source, score);
                         }
 
-                        if (/^[A-Za-z0-9_-]{3,25}$/.test(value)) {
-                            addUsernameCandidate(candidates, value, source, score);
-                        }
                     }
 
                     function inferLoggedInUsername() {
@@ -410,7 +413,10 @@ class BoardParser:
                                 for (let i = 0; i < storage.length; i++) {
                                     const key = storage.key(i) || '';
                                     const value = storage.getItem(key) || '';
-                                    if (/user|account|member|auth|profile|login/i.test(key)) {
+                                    if (/country|restricted|expiry|expires|timestamp|time|date|flag/i.test(key)) {
+                                        continue;
+                                    }
+                                    if (/(username|user_name|account|member|auth|profile|login)/i.test(key)) {
                                         addUsernamesFromText(
                                             candidates,
                                             value,
@@ -716,7 +722,7 @@ class BoardParser:
                         result.topPlayer = bestPlayerForSide('top');
                         result.bottomPlayer = bestPlayerForSide('bottom');
 
-                        if (!botName) {
+                        function inferBotFromGenericPanel() {
                             const topName = result.topPlayer
                                 ? normalizeName(result.topPlayer.username || result.topPlayer.text)
                                 : '';
@@ -731,19 +737,35 @@ class BoardParser:
                                 result.botUsername =
                                     result.bottomPlayer.username || result.bottomPlayer.text;
                                 result.debug.botUsernameSource = 'player-panel-generic-top';
+                                return true;
                             } else if (bottomGeneric && topName && !topGeneric) {
                                 botName = topName;
                                 result.botUsername =
                                     result.topPlayer.username || result.topPlayer.text;
                                 result.debug.botUsernameSource = 'player-panel-generic-bottom';
+                                return true;
                             }
+
+                            return false;
                         }
 
+                        if (!botName) inferBotFromGenericPanel();
+
                         if (botName) {
-                            const matches = playerCandidates.filter(
+                            let matches = playerCandidates.filter(
                                 (candidate) => nameMatches(candidate.normalizedNames, botName)
                             );
                             matches.sort((a, b) => a.distance - b.distance);
+
+                            if (matches.length === 0 && !configuredBotName) {
+                                if (inferBotFromGenericPanel()) {
+                                    matches = playerCandidates.filter(
+                                        (candidate) => nameMatches(candidate.normalizedNames, botName)
+                                    );
+                                    matches.sort((a, b) => a.distance - b.distance);
+                                }
+                            }
+
                             result.debug.playerIdentityMatches = matches.slice(0, 4);
 
                             if (matches.length > 0) {
