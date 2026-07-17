@@ -198,8 +198,79 @@ class BoardParser:
             self._last_fen = fen
             return fen
 
+        start_board = await self._maybe_starting_board()
+        if start_board is not None:
+            self._strategy_used = "initial_position"
+            self._last_board = start_board
+            self._last_fen = start_board.fen()
+            return self._last_fen
+
+        await self._log_board_parse_snapshot()
         logger.warning("All board parsing strategies failed!")
         return self._last_fen
+
+    async def _maybe_starting_board(self):
+        """
+        Use the normal starting position when a new white game has no moves yet.
+
+        Chess.com often renders an empty move list before White's first move.
+        Move replay is still the primary strategy after the first ply appears.
+        """
+        if self._last_clean_moves or self._move_count > 0:
+            return None
+        if self._our_color != chess.WHITE:
+            return None
+        if not await self._has_visible_game_board():
+            return None
+
+        turn = await self._detect_turn()
+        if turn != chess.WHITE:
+            return None
+
+        board = chess.Board()
+        logger.info("No move history yet; using standard starting position for White's first move.")
+        return board
+
+    async def _has_visible_game_board(self):
+        try:
+            return bool(await self.page.evaluate("""
+                () => {
+                    const board = document.querySelector(
+                        'wc-chess-board, chess-board, .board, #board-single'
+                    );
+                    if (!board) return false;
+                    const rect = board.getBoundingClientRect();
+                    return rect.width >= 100 && rect.height >= 100;
+                }
+            """))
+        except Exception:
+            return False
+
+    async def _log_board_parse_snapshot(self):
+        try:
+            snapshot = await self.page.evaluate("""
+                () => {
+                    const count = (selector) => document.querySelectorAll(selector).length;
+                    const board = document.querySelector(
+                        'wc-chess-board, chess-board, .board, #board-single'
+                    );
+                    const boardClass = board
+                        ? ((board.getAttribute('class') || board.className || '').toString()).substring(0, 160)
+                        : '';
+                    return {
+                        url: location.href,
+                        boardFound: !!board,
+                        boardClass,
+                        pieceCount: count('.piece'),
+                        dataSquareCount: count('[data-square]'),
+                        dataPlyCount: count('[data-ply]'),
+                        moveTextCount: count('.move-text-component, .move-node, .move-text'),
+                    };
+                }
+            """)
+            logger.warning("Board parse snapshot: %s", snapshot)
+        except Exception as e:
+            logger.debug("Board parse snapshot failed: %s", e)
 
     async def _parse_from_move_replay(self):
         """
