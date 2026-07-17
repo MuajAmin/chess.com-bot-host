@@ -71,12 +71,19 @@ class Notifier:
                     if len(parts) >= 1:
                         token_part = parts[0]
                         new_path = f"/{token_part}/sendMessage"
+                        query_params = urlparse.parse_qs(parsed.query)
+                        
+                        # Handle /bot<TOKEN>/<CHAT_ID> format directly
+                        if len(parts) >= 2 and parts[1] != "sendMessage":
+                            query_params['chat_id'] = [parts[1]]
+                            
+                        new_query = urlparse.urlencode(query_params, doseq=True)
                         self._webhook_url = urlparse.urlunparse((
                             parsed.scheme,
                             parsed.netloc,
                             new_path,
                             parsed.params,
-                            parsed.query,
+                            new_query,
                             parsed.fragment
                         ))
             except Exception as e:
