@@ -1158,21 +1158,90 @@ class BoardParser:
 
     async def _verify_orientation_from_pieces(self):
         """
-        Independent orientation check using document-level piece queries.
+        Independent orientation check that pierces Shadow DOM.
 
-        The game controller snapshot uses board.querySelectorAll which can miss
-        pieces that are siblings of the board element rather than children.
-        This method uses document.querySelectorAll('.piece') — the same
-        technique as the CSS class FEN strategy (which is proven to work).
+        Chess.com's wc-chess-board is a web component. Pieces are inside
+        its shadowRoot, invisible to document.querySelectorAll.
+        This method explicitly accesses board.shadowRoot to find pieces.
 
         Returns 'white', 'black', or None if pieces can't be found.
         """
         try:
             result = await self.page.evaluate("""
                 () => {
-                    const pieces = document.querySelectorAll('.piece');
-                    if (!pieces || pieces.length === 0) return null;
+                    const board = document.querySelector(
+                        'wc-chess-board, chess-board, .board, #board-single'
+                    );
+                    if (!board) return { error: 'no board element' };
 
+                    const boardRect = board.getBoundingClientRect();
+                    if (boardRect.width < 100 || boardRect.height < 100)
+                        return { error: 'board too small', w: boardRect.width, h: boardRect.height };
+
+                    // Try multiple ways to find pieces
+                    let pieces = null;
+                    let pieceSource = 'none';
+
+                    // 1. Shadow root
+                    if (board.shadowRoot) {
+                        pieces = board.shadowRoot.querySelectorAll('.piece');
+                        if (pieces && pieces.length > 0) pieceSource = 'shadowRoot';
+                    }
+
+                    // 2. Board children (in case no shadow DOM)
+                    if (!pieces || pieces.length === 0) {
+                        pieces = board.querySelectorAll('.piece');
+                        if (pieces && pieces.length > 0) pieceSource = 'board.children';
+                    }
+
+                    // 3. Document-level (pieces might be siblings)
+                    if (!pieces || pieces.length === 0) {
+                        pieces = document.querySelectorAll('.piece');
+                        if (pieces && pieces.length > 0) pieceSource = 'document';
+                    }
+
+                    // 4. Try square-based approach (pieces as CSS backgrounds on squares)
+                    if (!pieces || pieces.length === 0) {
+                        // Look for elements with square-XY and piece-type classes
+                        const root = board.shadowRoot || board;
+                        const allEls = root.querySelectorAll('*');
+                        const squarePieces = [];
+                        for (const el of allEls) {
+                            const cls = (el.className || '').toString();
+                            if (/\\b(square-\\d\\d)\\b/.test(cls) && /\\b[wb][pnbrqk]\\b/.test(cls)) {
+                                squarePieces.push(el);
+                            }
+                        }
+                        if (squarePieces.length > 0) {
+                            pieces = squarePieces;
+                            pieceSource = 'shadowRoot-wildcard';
+                        }
+                    }
+
+                    if (!pieces || pieces.length === 0) {
+                        // Last resort: check if board has a 'flipped' state
+                        // via its component API
+                        let flipped = null;
+                        try {
+                            if (typeof board.isFlipped === 'boolean') flipped = board.isFlipped;
+                            else if (typeof board.flipped === 'boolean') flipped = board.flipped;
+                            else if (board.game && typeof board.game.getOptions === 'function') {
+                                const opts = board.game.getOptions();
+                                if (opts && typeof opts.isWhiteOnBottom === 'boolean')
+                                    flipped = !opts.isWhiteOnBottom;
+                            }
+                        } catch(e) {}
+
+                        return {
+                            error: 'no pieces found',
+                            hasShadowRoot: !!board.shadowRoot,
+                            boardTag: board.tagName,
+                            flipped: flipped,
+                            boardAttrs: Array.from(board.attributes || []).map(a => a.name).join(','),
+                        };
+                    }
+
+                    const boardMidY = boardRect.top + boardRect.height / 2;
                     let wkY = null;
                     let bkY = null;
                     let topWhite = 0;
@@ -1180,26 +1249,15 @@ class BoardParser:
                     let bottomWhite = 0;
                     let bottomBlack = 0;
 
-                    // Find the board to determine midpoint
-                    const board = document.querySelector(
-                        'wc-chess-board, chess-board, .board, #board-single'
-                    );
-                    if (!board) return null;
-                    const boardRect = board.getBoundingClientRect();
-                    if (boardRect.width < 100 || boardRect.height < 100) return null;
-                    const boardMidY = boardRect.top + boardRect.height / 2;
-
                     for (const piece of pieces) {
                         const cls = (piece.className || '').toString();
                         const rect = piece.getBoundingClientRect();
                         if (rect.width === 0 || rect.height === 0) continue;
                         const midY = rect.top + rect.height / 2;
 
-                        // King positions
                         if (cls.includes('wk')) wkY = midY;
                         if (cls.includes('bk')) bkY = midY;
 
-                        // Piece colors by position
                         if (midY < boardMidY) {
                             if (/\\bw[pnbrqk]\\b/.test(cls)) topWhite++;
                             if (/\\bb[pnbrqk]\\b/.test(cls)) topBlack++;
@@ -1210,6 +1268,7 @@ class BoardParser:
                     }
 
                     return {
+                        pieceSource,
                         pieceCount: pieces.length,
                         wkY, bkY,
                         topWhite, topBlack,
@@ -1219,12 +1278,30 @@ class BoardParser:
             """)
 
             if not result:
-                logger.debug("Orientation cross-check: no pieces found via document query")
+                logger.info("Orientation cross-check: page.evaluate returned null")
+                return None
+
+            if result.get("error"):
+                # Even with an error, check if we got flipped info
+                flipped = result.get("flipped")
+                logger.info(
+                    "Orientation cross-check: %s (shadowRoot=%s, tag=%s, flipped=%s, attrs=%s)",
+                    result["error"],
+                    result.get("hasShadowRoot"),
+                    result.get("boardTag"),
+                    flipped,
+                    result.get("boardAttrs", "")[:100],
+                )
+                if flipped is True:
+                    return "black"
+                elif flipped is False:
+                    return "white"
                 return None
 
             logger.info(
-                "Orientation cross-check: pieces=%d, wkY=%s, bkY=%s, "
-                "bottomWhite=%d, bottomBlack=%d, topWhite=%d, topBlack=%d",
+                "Orientation cross-check: source=%s, pieces=%d, wkY=%s, bkY=%s, "
+                "bottomW=%d, bottomB=%d, topW=%d, topB=%d",
+                result.get("pieceSource"),
                 result.get("pieceCount", 0),
                 result.get("wkY"), result.get("bkY"),
                 result.get("bottomWhite", 0), result.get("bottomBlack", 0),
@@ -1247,7 +1324,7 @@ class BoardParser:
             return None
 
         except Exception as e:
-            logger.debug("Orientation cross-check failed: %s", e)
+            logger.info("Orientation cross-check exception: %s", e)
             return None
 
     def _log_failed_color_detection(self, snapshot):
