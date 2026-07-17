@@ -15,7 +15,9 @@ minified bundle randomizes fiber property names on every deploy.
 """
 
 import logging
+import asyncio
 import re
+import time
 import chess
 
 logger = logging.getLogger(__name__)
@@ -51,9 +53,11 @@ class BoardParser:
     Strategies 2-4 can only determine piece placement (position part of FEN).
     """
 
-    def __init__(self, page):
+    def __init__(self, page, username=""):
         self.page = page
+        self.username = username or ""
         self._our_color = None
+        self._board_orientation = None
         self._last_fen = None
         self._last_board = None  # Cache full Board object from move replay
         self._last_clean_moves = ()
@@ -67,6 +71,16 @@ class BoardParser:
     @property
     def is_white(self):
         return self._our_color == chess.WHITE
+
+    @property
+    def board_orientation(self):
+        return self._board_orientation
+
+    @property
+    def is_board_white_bottom(self):
+        if self._board_orientation is None:
+            return self.is_white
+        return self._board_orientation == chess.WHITE
 
     async def wait_for_board_ready(self, timeout_ms=15000):
         """Wait until the playable board is visible enough to parse and click."""
@@ -101,12 +115,14 @@ class BoardParser:
         """
         try:
             return await self.page.evaluate("""
-                () => {
+                (botUsername) => {
                     const result = {
                         selector: null,
                         tagName: null,
                         color: null,
                         colorMethod: null,
+                        orientation: null,
+                        orientationMethod: null,
                         turn: null,
                         fen: null,
                         debug: {}
@@ -173,6 +189,21 @@ class BoardParser:
                         return null;
                     }
 
+                    function oppositeColor(color) {
+                        if (color === 'white') return 'black';
+                        if (color === 'black') return 'white';
+                        return null;
+                    }
+
+                    function normalizeName(value) {
+                        return (value || '')
+                            .toString()
+                            .trim()
+                            .toLowerCase()
+                            .replace(/^@+/, '')
+                            .replace(/[^a-z0-9_-]/g, '');
+                    }
+
                     function debugValue(value) {
                         if (value === null || value === undefined) return value;
                         const type = typeof value;
@@ -199,6 +230,11 @@ class BoardParser:
                                         result.colorMethod = 'game.getOptions().isPlayerBlack';
                                     }
 
+                                    if (typeof opts.isWhiteOnBottom === 'boolean') {
+                                        result.orientation = opts.isWhiteOnBottom ? 'white' : 'black';
+                                        result.orientationMethod = 'game.getOptions().isWhiteOnBottom';
+                                    }
+
                                     if (!result.color) {
                                         const optionColor =
                                             colorFromValue(opts.playingAs) ||
@@ -208,11 +244,6 @@ class BoardParser:
                                             result.color = optionColor;
                                             result.colorMethod = 'game.getOptions().playing-color';
                                         }
-                                    }
-
-                                    if (!result.color && typeof opts.isWhiteOnBottom === 'boolean') {
-                                        result.color = opts.isWhiteOnBottom ? 'white' : 'black';
-                                        result.colorMethod = 'game.getOptions().isWhiteOnBottom';
                                     }
                                 }
                             }
@@ -261,6 +292,135 @@ class BoardParser:
                         }
                     }
 
+                    if (!result.orientation) {
+                        const orientation =
+                            board.orientation ||
+                            board.getAttribute('orientation') ||
+                            (board.dataset ? board.dataset.orientation : '') ||
+                            '';
+                        result.debug.orientation = debugValue(orientation);
+                        const orientationColor = colorFromValue(orientation);
+                        if (orientationColor) {
+                            result.orientation = orientationColor;
+                            result.orientationMethod = 'board.orientation';
+                        }
+                    }
+
+                    if (!result.orientation && typeof board.flipped === 'boolean') {
+                        result.debug.boardFlipped = board.flipped;
+                        result.orientation = board.flipped ? 'black' : 'white';
+                        result.orientationMethod = 'board.flipped';
+                    }
+
+                    if (!result.orientation) {
+                        const coordEls = board.querySelectorAll(
+                            '[class*="coordinate"], [class*="notation"], ' +
+                            '.coords-rank text, .coords-rank span, ' +
+                            'svg text, .board-coordinates span'
+                        );
+                        let rank1Y = null;
+                        let rank8Y = null;
+                        for (const el of coordEls) {
+                            const txt = (el.textContent || '').trim();
+                            const rect = el.getBoundingClientRect();
+                            const midY = rect.top + rect.height / 2;
+                            if (txt === '1') rank1Y = midY;
+                            if (txt === '8') rank8Y = midY;
+                        }
+                        result.debug.orientationRank1Y = rank1Y;
+                        result.debug.orientationRank8Y = rank8Y;
+                        if (rank1Y !== null && rank8Y !== null) {
+                            result.orientation = rank1Y > rank8Y ? 'white' : 'black';
+                            result.orientationMethod = 'coordinates';
+                        }
+                    }
+
+                    const botName = normalizeName(botUsername);
+                    if (!result.color && botName && result.orientation) {
+                        const boardRect = board.getBoundingClientRect();
+                        const boardMidY = boardRect.top + boardRect.height / 2;
+                        const leftLimit = boardRect.left - boardRect.width * 0.8;
+                        const rightLimit = boardRect.right + boardRect.width * 0.8;
+                        const topLimit = boardRect.top - boardRect.height * 0.8;
+                        const bottomLimit = boardRect.bottom + boardRect.height * 0.8;
+
+                        function namesForElement(el) {
+                            const values = [
+                                el.getAttribute('data-username'),
+                                el.getAttribute('data-player-username'),
+                                el.getAttribute('username'),
+                                el.getAttribute('aria-label'),
+                                el.getAttribute('title'),
+                                el.textContent
+                            ];
+                            const href = el.getAttribute('href') || '';
+                            const hrefMatch = href.match(/\\/(?:member|user)\\/([^/?#]+)/i);
+                            if (hrefMatch) values.push(hrefMatch[1]);
+                            return values.map(normalizeName).filter(Boolean);
+                        }
+
+                        function nameMatches(names, target) {
+                            return names.some((name) => (
+                                name === target ||
+                                (target.length >= 3 && name.includes(target)) ||
+                                (name.length >= 3 && target.includes(name))
+                            ));
+                        }
+
+                        const playerSelectors = [
+                            '[data-username]',
+                            '[data-player-username]',
+                            '.user-username',
+                            '[class*="username"]',
+                            '[class*="player"] a[href*="/member/"]',
+                            '[class*="player"] a[href*="/user/"]',
+                            'a[href*="/member/"]',
+                            'a[href*="/user/"]'
+                        ];
+                        const seenPlayers = new Set();
+                        const matches = [];
+
+                        for (const selector of playerSelectors) {
+                            for (const el of document.querySelectorAll(selector)) {
+                                if (!el || seenPlayers.has(el)) continue;
+                                seenPlayers.add(el);
+
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width <= 0 || rect.height <= 0) continue;
+                                const midX = rect.left + rect.width / 2;
+                                const midY = rect.top + rect.height / 2;
+                                if (
+                                    midX < leftLimit || midX > rightLimit ||
+                                    midY < topLimit || midY > bottomLimit
+                                ) {
+                                    continue;
+                                }
+
+                                const names = namesForElement(el);
+                                if (!nameMatches(names, botName)) continue;
+
+                                matches.push({
+                                    text: (el.textContent || '').trim().slice(0, 80),
+                                    tagName: el.tagName,
+                                    className: (el.className || '').toString().slice(0, 120),
+                                    side: midY > boardMidY ? 'bottom' : 'top',
+                                    distance: Math.abs(midY - boardMidY)
+                                });
+                            }
+                        }
+
+                        matches.sort((a, b) => a.distance - b.distance);
+                        result.debug.playerIdentityMatches = matches.slice(0, 4);
+
+                        if (matches.length > 0) {
+                            const side = matches[0].side;
+                            result.color = side === 'bottom'
+                                ? result.orientation
+                                : oppositeColor(result.orientation);
+                            result.colorMethod = 'player-panel-username';
+                        }
+                    }
+
                     if (!result.turn && result.fen) {
                         const parts = result.fen.split(' ');
                         if (parts.length >= 2 && (parts[1] === 'w' || parts[1] === 'b')) {
@@ -268,29 +428,9 @@ class BoardParser:
                         }
                     }
 
-                    if (!result.color) {
-                        const orientation =
-                            board.orientation ||
-                            board.getAttribute('orientation') ||
-                            (board.dataset ? board.dataset.orientation : '') ||
-                            '';
-                        result.debug.orientation = orientation;
-                        const orientationColor = colorFromValue(orientation);
-                        if (orientationColor) {
-                            result.color = orientationColor;
-                            result.colorMethod = 'board.orientation';
-                        }
-                    }
-
-                    if (!result.color && typeof board.flipped === 'boolean') {
-                        result.debug.boardFlipped = board.flipped;
-                        result.color = board.flipped ? 'black' : 'white';
-                        result.colorMethod = 'board.flipped';
-                    }
-
                     return result;
                 }
-            """)
+            """, self.username)
         except Exception as e:
             logger.debug("Game controller snapshot failed: %s", e)
             return None
@@ -310,14 +450,20 @@ class BoardParser:
             await self.wait_for_board_ready()
 
             controller_result = await self._read_game_controller_snapshot()
+            if controller_result and controller_result.get("orientation") in ("white", "black"):
+                self._board_orientation = (
+                    chess.WHITE if controller_result["orientation"] == "white" else chess.BLACK
+                )
+
             if controller_result and controller_result.get("color") in ("white", "black"):
                 self._our_color = (
                     chess.WHITE if controller_result["color"] == "white" else chess.BLACK
                 )
                 logger.info(
-                    "Detected: Playing as %s (method: %s, debug: %s)",
+                    "Detected: Playing as %s (method: %s, board_bottom: %s, debug: %s)",
                     "WHITE" if self._our_color == chess.WHITE else "BLACK",
                     controller_result.get("colorMethod", "game-controller"),
+                    "WHITE" if self.is_board_white_bottom else "BLACK",
                     controller_result.get("debug", {}),
                 )
                 return self._our_color
@@ -477,10 +623,12 @@ class BoardParser:
                 self._our_color = (
                     chess.WHITE if color_result["color"] == "white" else chess.BLACK
                 )
+                self._board_orientation = self._our_color
                 logger.info(
-                    "Detected: Playing as %s (method: %s, debug: %s)",
+                    "Detected: Playing as %s (method: %s, board_bottom: %s, debug: %s)",
                     "WHITE" if self._our_color == chess.WHITE else "BLACK",
                     color_result.get("method", "unknown"),
+                    "WHITE" if self.is_board_white_bottom else "BLACK",
                     color_result.get("debug", {}),
                 )
                 return self._our_color
@@ -492,11 +640,13 @@ class BoardParser:
                 color_result.get("debug", {}) if color_result else "no result",
             )
             self._our_color = chess.WHITE
+            self._board_orientation = chess.WHITE
             return chess.WHITE
 
         except Exception as e:
             logger.warning("Color detection failed, defaulting to WHITE: %s", e)
             self._our_color = chess.WHITE
+            self._board_orientation = chess.WHITE
             return chess.WHITE
 
     async def get_board_fen(self):
@@ -1379,6 +1529,33 @@ class BoardParser:
         """Check if it's currently our turn to move."""
         turn = await self._detect_turn()
         return turn == self._our_color
+
+    async def wait_for_position_change(self, previous_fen, timeout_sec=6.0):
+        """
+        Wait briefly after a click until Chess.com exposes a changed position.
+
+        Mouse events can return before the move list/FEN has updated. Without this
+        guard the game loop can read the old position again and try the same move
+        twice, as seen with repeated e2e4 in the runtime log.
+        """
+        deadline = time.monotonic() + timeout_sec
+        previous_position = previous_fen.split(" ", 1)[0] if previous_fen else None
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
+            board = await self.get_full_board()
+            if board is None:
+                continue
+
+            current_fen = board.fen()
+            current_position = current_fen.split(" ", 1)[0]
+            if current_fen != previous_fen and current_position != previous_position:
+                return True
+
+            if self._our_color is not None and board.turn != self._our_color:
+                return True
+
+        return False
 
     async def get_remaining_time(self):
         """

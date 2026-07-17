@@ -134,12 +134,17 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
     """
     # Detect which color we're playing
     await board_parser.detect_our_color()
-    move_maker.set_color(board_parser.is_white)
+    move_maker.set_color(board_parser.is_board_white_bottom)
     humanizer.reset()
 
     color_name = "WHITE" if board_parser.is_white else "BLACK"
+    board_bottom = "WHITE" if board_parser.is_board_white_bottom else "BLACK"
     logger.info("=" * 50)
-    logger.info("GAME STARTED — Playing as %s (subprocess worker)", color_name)
+    logger.info(
+        "GAME STARTED - Playing as %s (board bottom: %s, subprocess worker)",
+        color_name,
+        board_bottom,
+    )
     logger.info("=" * 50)
 
     # Detect time control and feed to timing model
@@ -284,6 +289,13 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 await asyncio.sleep(1)
                 continue
 
+            if not await board_parser.wait_for_position_change(board.fen()):
+                logger.warning(
+                    "Clicked %s but board state did not advance within timeout; "
+                    "will re-check before retrying.",
+                    move.uci(),
+                )
+
             logger.info(
                 "Move played: %s (move #%d)",
                 board.san(move), humanizer._move_number,
@@ -341,7 +353,7 @@ async def worker_main():
             logger.info("Connected to page: %s", page.url[:80])
 
             # Initialize game components (all in THIS subprocess)
-            board_parser = BoardParser(page)
+            board_parser = BoardParser(page, config.username)
             engine = Lc0Engine(config)
             humanizer = HumanTiming(config)
             move_maker = MoveMaker(page)

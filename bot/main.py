@@ -89,12 +89,17 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
 
     # Detect which color we're playing
     await board_parser.detect_our_color()
-    move_maker.set_color(board_parser.is_white)
+    move_maker.set_color(board_parser.is_board_white_bottom)
     humanizer.reset()
 
     color_name = "WHITE" if board_parser.is_white else "BLACK"
+    board_bottom = "WHITE" if board_parser.is_board_white_bottom else "BLACK"
     logger.info("=" * 50)
-    logger.info("GAME STARTED — Playing as %s (in-process fallback)", color_name)
+    logger.info(
+        "GAME STARTED - Playing as %s (board bottom: %s, in-process fallback)",
+        color_name,
+        board_bottom,
+    )
     logger.info("=" * 50)
 
     # Detect time control and feed to timing model
@@ -229,6 +234,13 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 consecutive_errors += 1
                 await asyncio.sleep(1)
                 continue
+
+            if not await board_parser.wait_for_position_change(board.fen()):
+                logger.warning(
+                    "Clicked %s but board state did not advance within timeout; "
+                    "will re-check before retrying.",
+                    move.uci(),
+                )
 
             logger.info(
                 "Move played: %s (move #%d)",
@@ -451,7 +463,7 @@ async def main():
                         )
                         continue
 
-                    board_parser = BoardParser(session.page)
+                    board_parser = BoardParser(session.page, config.username)
                     humanizer = HumanTiming(config)
                     move_maker = MoveMaker(session.page)
 

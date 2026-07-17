@@ -128,7 +128,7 @@ class MoveMaker:
         self._board_box = None
 
     def set_color(self, is_white):
-        """Set which color we're playing (affects coordinate mapping)."""
+        """Set whether White is at the bottom of the visible board."""
         self.is_white = is_white
 
     async def make_move(self, move):
