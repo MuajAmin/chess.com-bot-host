@@ -90,18 +90,237 @@ class BoardParser:
             logger.warning("Board did not become ready within %.1fs: %s", timeout_ms / 1000, e)
             return False
 
+    async def _read_game_controller_snapshot(self):
+        """
+        Read Chess.com's board controller state using the same API surface Mint.js uses.
+
+        Mint.js initializes from either WC-CHESS-BOARD or CHESS-BOARD and then reads
+        chessboard.game.getOptions().isPlayerBlack. Query both tags here so black
+        games do not fall through to the old WHITE default when only chess-board is
+        present.
+        """
+        try:
+            return await self.page.evaluate("""
+                () => {
+                    const result = {
+                        selector: null,
+                        tagName: null,
+                        color: null,
+                        colorMethod: null,
+                        turn: null,
+                        fen: null,
+                        debug: {}
+                    };
+
+                    const selectors = [
+                        'wc-chess-board',
+                        'chess-board',
+                        '.board',
+                        '#board-single'
+                    ];
+                    const seen = new Set();
+                    const candidates = [];
+
+                    for (const selector of selectors) {
+                        for (const el of document.querySelectorAll(selector)) {
+                            if (!el || seen.has(el)) continue;
+                            seen.add(el);
+
+                            const rect = el.getBoundingClientRect();
+                            const visible = rect.width >= 100 && rect.height >= 100;
+                            candidates.push({
+                                el,
+                                selector,
+                                tagName: el.tagName,
+                                visible,
+                                area: rect.width * rect.height,
+                                hasGame: !!el.game
+                            });
+                        }
+                    }
+
+                    candidates.sort((a, b) => {
+                        const aScore = (a.visible ? 4 : 0) + (a.hasGame ? 2 : 0);
+                        const bScore = (b.visible ? 4 : 0) + (b.hasGame ? 2 : 0);
+                        if (aScore !== bScore) return bScore - aScore;
+                        return b.area - a.area;
+                    });
+
+                    result.debug.candidates = candidates.map((c) => ({
+                        selector: c.selector,
+                        tagName: c.tagName,
+                        visible: c.visible,
+                        hasGame: c.hasGame,
+                        area: Math.round(c.area)
+                    }));
+
+                    const picked = candidates.find((c) => c.hasGame && c.visible) ||
+                                   candidates.find((c) => c.hasGame) ||
+                                   candidates.find((c) => c.visible) ||
+                                   candidates[0];
+                    if (!picked) return result;
+
+                    const board = picked.el;
+                    result.selector = picked.selector;
+                    result.tagName = picked.tagName;
+
+                    function colorFromValue(value) {
+                        if (value === 1 || value === '1') return 'white';
+                        if (value === 2 || value === '2') return 'black';
+                        const text = (value || '').toString().trim().toLowerCase();
+                        if (text === 'w' || text === 'white') return 'white';
+                        if (text === 'b' || text === 'black') return 'black';
+                        return null;
+                    }
+
+                    function debugValue(value) {
+                        if (value === null || value === undefined) return value;
+                        const type = typeof value;
+                        if (type === 'string' || type === 'number' || type === 'boolean') {
+                            return value;
+                        }
+                        return Object.prototype.toString.call(value);
+                    }
+
+                    const game = board.game;
+                    if (game) {
+                        try {
+                            if (game.getOptions) {
+                                const opts = game.getOptions();
+                                if (opts) {
+                                    result.debug.isPlayerBlack = debugValue(opts.isPlayerBlack);
+                                    result.debug.isWhiteOnBottom = debugValue(opts.isWhiteOnBottom);
+                                    result.debug.flipped = debugValue(opts.flipped);
+                                    result.debug.playingAs = debugValue(opts.playingAs);
+                                    result.debug.playerColor = debugValue(opts.playerColor);
+
+                                    if (typeof opts.isPlayerBlack === 'boolean') {
+                                        result.color = opts.isPlayerBlack ? 'black' : 'white';
+                                        result.colorMethod = 'game.getOptions().isPlayerBlack';
+                                    }
+
+                                    if (!result.color) {
+                                        const optionColor =
+                                            colorFromValue(opts.playingAs) ||
+                                            colorFromValue(opts.playerColor) ||
+                                            colorFromValue(opts.userColor);
+                                        if (optionColor) {
+                                            result.color = optionColor;
+                                            result.colorMethod = 'game.getOptions().playing-color';
+                                        }
+                                    }
+
+                                    if (!result.color && typeof opts.isWhiteOnBottom === 'boolean') {
+                                        result.color = opts.isWhiteOnBottom ? 'white' : 'black';
+                                        result.colorMethod = 'game.getOptions().isWhiteOnBottom';
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            result.debug.getOptionsError = e.message;
+                        }
+
+                        try {
+                            if (!result.color && game.getPlayingAs) {
+                                const playingAs = game.getPlayingAs();
+                                result.debug.getPlayingAs = debugValue(playingAs);
+                                const playingColor = colorFromValue(playingAs);
+                                if (playingColor) {
+                                    result.color = playingColor;
+                                    result.colorMethod = 'game.getPlayingAs()';
+                                }
+                            }
+                        } catch (e) {
+                            result.debug.getPlayingAsError = e.message;
+                        }
+
+                        try {
+                            if (game.getTurn) {
+                                const turn = game.getTurn();
+                                result.debug.getTurn = debugValue(turn);
+                                if (turn === 1 || turn === '1') result.turn = 'w';
+                                else if (turn === 2 || turn === '2') result.turn = 'b';
+                                else {
+                                    const turnColor = colorFromValue(turn);
+                                    if (turnColor) result.turn = turnColor === 'white' ? 'w' : 'b';
+                                }
+                            }
+                        } catch (e) {
+                            result.debug.getTurnError = e.message;
+                        }
+
+                        try {
+                            if (game.getFEN) result.fen = game.getFEN();
+                            else if (game.fen) {
+                                result.fen = typeof game.fen === 'function'
+                                    ? game.fen()
+                                    : game.fen;
+                            }
+                        } catch (e) {
+                            result.debug.getFENError = e.message;
+                        }
+                    }
+
+                    if (!result.turn && result.fen) {
+                        const parts = result.fen.split(' ');
+                        if (parts.length >= 2 && (parts[1] === 'w' || parts[1] === 'b')) {
+                            result.turn = parts[1];
+                        }
+                    }
+
+                    if (!result.color) {
+                        const orientation =
+                            board.orientation ||
+                            board.getAttribute('orientation') ||
+                            (board.dataset ? board.dataset.orientation : '') ||
+                            '';
+                        result.debug.orientation = orientation;
+                        const orientationColor = colorFromValue(orientation);
+                        if (orientationColor) {
+                            result.color = orientationColor;
+                            result.colorMethod = 'board.orientation';
+                        }
+                    }
+
+                    if (!result.color && typeof board.flipped === 'boolean') {
+                        result.debug.boardFlipped = board.flipped;
+                        result.color = board.flipped ? 'black' : 'white';
+                        result.colorMethod = 'board.flipped';
+                    }
+
+                    return result;
+                }
+            """)
+        except Exception as e:
+            logger.debug("Game controller snapshot failed: %s", e)
+            return None
+
     async def detect_our_color(self):
         """Detect which color we are playing.
 
         Uses multiple strategies in order of reliability:
-        1. Board coordinate labels (which rank is at bottom)
-        2. Piece position on the board (king file positions)
-        3. Clock/player panel color classes
-        4. Board flipped attribute/class
-        5. Default to WHITE (last resort)
+        1. Game controller options, matching Mint.js
+        2. Board coordinate labels (which rank is at bottom)
+        3. Piece position on the board (king file positions)
+        4. Clock/player panel color classes
+        5. Board flipped attribute/class
+        6. Default to WHITE (last resort)
         """
         try:
             await self.wait_for_board_ready()
+
+            controller_result = await self._read_game_controller_snapshot()
+            if controller_result and controller_result.get("color") in ("white", "black"):
+                self._our_color = (
+                    chess.WHITE if controller_result["color"] == "white" else chess.BLACK
+                )
+                logger.info(
+                    "Detected: Playing as %s (method: %s, debug: %s)",
+                    "WHITE" if self._our_color == chess.WHITE else "BLACK",
+                    controller_result.get("colorMethod", "game-controller"),
+                    controller_result.get("debug", {}),
+                )
+                return self._our_color
 
             color_result = await self.page.evaluate("""
                 () => {
@@ -115,7 +334,7 @@ class BoardParser:
                     // Chess.com's wc-chess-board has a .game controller with
                     // getOptions() that returns { isPlayerBlack, flipped, ... }
                     // This is the MOST RELIABLE method — same as Mint.js uses.
-                    const wcBoard = document.querySelector('wc-chess-board');
+                    const wcBoard = document.querySelector('wc-chess-board, chess-board');
                     if (wcBoard && wcBoard.game) {
                         try {
                             const opts = wcBoard.game.getOptions
@@ -663,10 +882,23 @@ class BoardParser:
         fiber property names. Only uses documented/stable API surfaces.
         """
         try:
+            snapshot = await self._read_game_controller_snapshot()
+            fen = snapshot.get("fen") if snapshot else None
+            if fen and "/" in fen:
+                logger.debug(
+                    "JS state FEN from %s: %s",
+                    snapshot.get("selector", "game-controller"),
+                    fen[:60],
+                )
+                if " " in fen:
+                    return fen
+                turn = await self._detect_turn()
+                return f"{fen} {'w' if turn == chess.WHITE else 'b'} KQkq - 0 1"
+
             fen = await self.page.evaluate("""
                 () => {
-                    // Method A: wc-chess-board component's game property
-                    const board = document.querySelector('wc-chess-board');
+                    // Method A: board component's game property
+                    const board = document.querySelector('wc-chess-board, chess-board');
                     if (board) {
                         // Try the component's internal game/position property
                         if (board.game && board.game.getFEN) {
@@ -959,9 +1191,22 @@ class BoardParser:
         """
         # Strategy 0: Game controller API (Mint.js approach)
         try:
+            snapshot = await self._read_game_controller_snapshot()
+            fen = snapshot.get("fen") if snapshot else None
+            if fen and "/" in fen and " " in fen:
+                try:
+                    board = chess.Board(fen)
+                    if board.is_valid():
+                        self._strategy_used = "game_controller"
+                        self._last_board = board
+                        self._last_fen = fen
+                        return board
+                except Exception:
+                    pass
+
             fen = await self.page.evaluate("""
                 () => {
-                    const board = document.querySelector('wc-chess-board');
+                    const board = document.querySelector('wc-chess-board, chess-board');
                     if (board && board.game && board.game.getFEN) {
                         return board.game.getFEN();
                     }
@@ -1007,9 +1252,16 @@ class BoardParser:
             # Method 0: Game controller API (Mint.js approach)
             # getTurn() returns 1 (White) or 2 (Black)
             # getFEN() returns the full FEN — turn is the 2nd field
+            snapshot = await self._read_game_controller_snapshot()
+            turn_result = snapshot.get("turn") if snapshot else None
+            if turn_result == 'w':
+                return chess.WHITE
+            elif turn_result == 'b':
+                return chess.BLACK
+
             turn_result = await self.page.evaluate("""
                 () => {
-                    const board = document.querySelector('wc-chess-board');
+                    const board = document.querySelector('wc-chess-board, chess-board');
                     if (board && board.game) {
                         // getTurn() returns 1=White, 2=Black
                         if (board.game.getTurn) {
@@ -1060,7 +1312,7 @@ class BoardParser:
 
                         // Determine if this clock is top or bottom
                         const rect = clock.getBoundingClientRect();
-                        const boardEl = document.querySelector('wc-chess-board, .board');
+                        const boardEl = document.querySelector('wc-chess-board, chess-board, .board');
                         if (boardEl) {
                             const boardRect = boardEl.getBoundingClientRect();
                             const boardMid = boardRect.top + boardRect.height / 2;
@@ -1167,7 +1419,7 @@ class BoardParser:
                     );
 
                     const clocks = [];
-                    const boardEl = document.querySelector('wc-chess-board, .board');
+                    const boardEl = document.querySelector('wc-chess-board, chess-board, .board');
                     const boardRect = boardEl ? boardEl.getBoundingClientRect() : null;
                     const boardMid = boardRect ? boardRect.top + boardRect.height / 2 : 0;
 
