@@ -120,6 +120,18 @@ class BoardParser:
             return chess.WHITE
         return None
 
+    def _opposite_color_name(self, color):
+        if color == "white":
+            return "black"
+        if color == "black":
+            return "white"
+        return None
+
+    def _color_from_orientation_and_side(self, orientation, bot_side):
+        if orientation not in ("white", "black") or bot_side not in ("top", "bottom"):
+            return None
+        return orientation if bot_side == "bottom" else self._opposite_color_name(orientation)
+
     def _current_bot_side(self):
         if self._bot_side in ("top", "bottom"):
             return self._bot_side
@@ -1002,8 +1014,13 @@ class BoardParser:
                 has_orientation = snapshot.get("orientation") in ("white", "black")
                 has_player_info = bool(snapshot.get("topPlayer") or snapshot.get("bottomPlayer"))
                 has_bot_side = snapshot.get("botSide") in ("top", "bottom")
+                elapsed = time.monotonic() - started_at
 
-                if has_board and (has_direct_color or (has_orientation and has_player_info) or has_bot_side):
+                if has_board and (
+                    (has_bot_side and (has_orientation or has_direct_color)) or
+                    (has_orientation and has_player_info) or
+                    (has_direct_color and has_orientation and elapsed >= 3.0)
+                ):
                     return True
 
             await asyncio.sleep(0.25)
@@ -1052,6 +1069,21 @@ class BoardParser:
         snapshot = None
         color_method = None
         orientation_method = None
+        controller_color_methods = {
+            "game.getOptions().isPlayerBlack",
+            "game.getOptions().isPlayerBlack(numeric)",
+            "board.options.isPlayerBlack",
+        }
+        visible_orientation_methods = {
+            "piece-position-crosscheck",
+            "data-square-position",
+            "coordinates",
+            "king-screen-position",
+            "board.flipped",
+            "board.class-flipped",
+            "board.class-orientation",
+            "board.orientation",
+        }
 
         try:
             identity_ready = await self.wait_for_game_identity_ready()
@@ -1073,49 +1105,120 @@ class BoardParser:
                     bot_color = snapshot.get("color")
                     color_method = snapshot.get("colorMethod")
 
-                    if bot_color not in ("white", "black"):
-                        if orientation in ("white", "black") and bot_side in ("top", "bottom"):
-                            bot_color = (
-                                orientation
-                                if bot_side == "bottom"
-                                else ("black" if orientation == "white" else "white")
+                    verified_orientation = await self._verify_orientation_from_pieces()
+                    if verified_orientation:
+                        if orientation not in ("white", "black"):
+                            orientation = verified_orientation
+                            orientation_method = "piece-position-crosscheck"
+                        elif verified_orientation != orientation:
+                            logger.warning(
+                                "Orientation conflict: snapshot said '%s' (%s) "
+                                "but visible pieces show '%s'. Using visible board orientation.",
+                                orientation,
+                                orientation_method,
+                                verified_orientation,
                             )
-                            color_method = "board-orientation+username-position"
+                            orientation = verified_orientation
+                            orientation_method = "piece-position-crosscheck"
 
                     if orientation not in ("white", "black"):
                         if bot_color in ("white", "black") and bot_side in ("top", "bottom"):
                             orientation = (
                                 bot_color
                                 if bot_side == "bottom"
-                                else ("black" if bot_color == "white" else "white")
+                                else self._opposite_color_name(bot_color)
                             )
                             orientation_method = "bot-color+username-position"
 
-                    if bot_color in ("white", "black"):
-                        # Cross-check: if color was inferred from orientation
-                        # (not from game API), verify orientation with a
-                        # document-level piece query. The snapshot's board.querySelectorAll
-                        # can miss pieces outside the board element.
-                        if color_method in (
-                            "player-panel-username",
-                            "board-orientation+username-position",
-                        ):
-                            verified_orientation = await self._verify_orientation_from_pieces()
-                            if verified_orientation and verified_orientation != orientation:
-                                logger.warning(
-                                    "Orientation cross-check: snapshot said '%s' (%s) "
-                                    "but pieces show '%s'. Correcting.",
-                                    orientation, orientation_method, verified_orientation,
-                                )
-                                orientation = verified_orientation
-                                orientation_method = "piece-position-crosscheck"
-                                # Recalculate color from corrected orientation
-                                if bot_side == "bottom":
-                                    bot_color = orientation
-                                else:
-                                    bot_color = "black" if orientation == "white" else "white"
-                                color_method = "player-panel-username+crosscheck"
+                    if bot_color not in ("white", "black"):
+                        panel_color = self._color_from_orientation_and_side(orientation, bot_side)
+                        if panel_color:
+                            bot_color = panel_color
+                            color_method = "board-orientation+username-position"
 
+                    panel_color = self._color_from_orientation_and_side(orientation, bot_side)
+                    if (
+                        panel_color in ("white", "black") and
+                        bot_color in ("white", "black") and
+                        bot_color != panel_color
+                    ):
+                        logger.warning(
+                            "Color conflict: controller said bot is %s (%s), "
+                            "but bot side %s with %s bottom means %s. Using player-panel color.",
+                            bot_color,
+                            color_method or "unknown",
+                            bot_side,
+                            orientation,
+                            panel_color,
+                        )
+                        bot_color = panel_color
+                        color_method = "player-panel-username+orientation"
+
+                    if (
+                        bot_color in ("white", "black") and
+                        bot_side not in ("top", "bottom") and
+                        color_method in controller_color_methods and
+                        attempt < max_attempts
+                    ):
+                        logger.info(
+                            "Color detection attempt %d/%d: controller says %s via %s, "
+                            "but player-panel side is not loaded yet. Retrying in 1s...",
+                            attempt,
+                            max_attempts,
+                            bot_color,
+                            color_method,
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    if (
+                        bot_color in ("white", "black") and
+                        bot_side not in ("top", "bottom") and
+                        orientation in ("white", "black") and
+                        color_method in controller_color_methods and
+                        (
+                            verified_orientation or
+                            orientation_method in visible_orientation_methods
+                        ) and
+                        bot_color != orientation
+                    ):
+                        logger.warning(
+                            "Controller color %s (%s) conflicts with visible %s-bottom board "
+                            "and no player-panel side was found. Assuming the bot is the bottom player.",
+                            bot_color,
+                            color_method,
+                            orientation,
+                        )
+                        bot_side = "bottom"
+                        bot_color = orientation
+                        color_method = "visible-board-bottom-assumption"
+
+                    if (
+                        bot_color not in ("white", "black") and
+                        bot_side not in ("top", "bottom") and
+                        (
+                            verified_orientation or
+                            (
+                                orientation in ("white", "black") and
+                                orientation_method in visible_orientation_methods
+                            )
+                        ) and
+                        attempt == max_attempts
+                    ):
+                        assumed_orientation = verified_orientation or orientation
+                        logger.warning(
+                            "No player color was found, but visible board is %s-bottom. "
+                            "Assuming the bot is the bottom player.",
+                            assumed_orientation,
+                        )
+                        orientation = assumed_orientation
+                        if verified_orientation:
+                            orientation_method = "piece-position-crosscheck"
+                        bot_side = "bottom"
+                        bot_color = assumed_orientation
+                        color_method = "visible-board-bottom-assumption"
+
+                    if bot_color in ("white", "black"):
                         self._set_colors(bot_color=bot_color, board_orientation=orientation, bot_side=bot_side)
 
                         if self._board_orientation is None:
@@ -1169,10 +1272,43 @@ class BoardParser:
         try:
             result = await self.page.evaluate("""
                 () => {
-                    const board = document.querySelector(
-                        'wc-chess-board, chess-board, .board, #board-single'
-                    );
-                    if (!board) return { error: 'no board element' };
+                    const selectors = [
+                        'wc-chess-board',
+                        'chess-board',
+                        '.board',
+                        '#board-single'
+                    ];
+                    const seen = new Set();
+                    const candidates = [];
+                    for (const selector of selectors) {
+                        for (const el of document.querySelectorAll(selector)) {
+                            if (!el || seen.has(el)) continue;
+                            seen.add(el);
+                            const rect = el.getBoundingClientRect();
+                            const visible = rect.width >= 100 && rect.height >= 100;
+                            candidates.push({
+                                el,
+                                selector,
+                                visible,
+                                area: rect.width * rect.height,
+                                hasGame: !!el.game
+                            });
+                        }
+                    }
+                    candidates.sort((a, b) => {
+                        const aScore = (a.visible ? 4 : 0) + (a.hasGame ? 2 : 0);
+                        const bScore = (b.visible ? 4 : 0) + (b.hasGame ? 2 : 0);
+                        if (aScore !== bScore) return bScore - aScore;
+                        return b.area - a.area;
+                    });
+
+                    const picked = candidates.find((c) => c.hasGame && c.visible) ||
+                                   candidates.find((c) => c.hasGame) ||
+                                   candidates.find((c) => c.visible) ||
+                                   candidates[0];
+                    if (!picked) return { error: 'no board element' };
+
+                    const board = picked.el;
 
                     const boardRect = board.getBoundingClientRect();
                     if (boardRect.width < 100 || boardRect.height < 100)
@@ -1236,6 +1372,7 @@ class BoardParser:
                             error: 'no pieces found',
                             hasShadowRoot: !!board.shadowRoot,
                             boardTag: board.tagName,
+                            selector: picked.selector,
                             flipped: flipped,
                             boardAttrs: Array.from(board.attributes || []).map(a => a.name).join(','),
                         };
@@ -1269,6 +1406,7 @@ class BoardParser:
 
                     return {
                         pieceSource,
+                        selector: picked.selector,
                         pieceCount: pieces.length,
                         wkY, bkY,
                         topWhite, topBlack,
