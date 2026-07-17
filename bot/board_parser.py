@@ -56,6 +56,7 @@ class BoardParser:
     def __init__(self, page, username=""):
         self.page = page
         self.username = username or ""
+        self._detected_username = ""
         self._our_color = None
         self._bot_color = None
         self._bot_side = None
@@ -167,6 +168,7 @@ class BoardParser:
                         colorMethod: null,
                         orientation: null,
                         orientationMethod: null,
+                        botUsername: null,
                         botSide: null,
                         topPlayer: null,
                         bottomPlayer: null,
@@ -258,6 +260,178 @@ class BoardParser:
                             return value;
                         }
                         return Object.prototype.toString.call(value);
+                    }
+
+                    function isGenericUsername(value) {
+                        const name = normalizeName(value);
+                        return (
+                            !name ||
+                            name === 'opponent' ||
+                            name === 'player' ||
+                            name === 'guest' ||
+                            name === 'anonymous' ||
+                            name === 'white' ||
+                            name === 'black'
+                        );
+                    }
+
+                    function addUsernameCandidate(candidates, rawValue, source, score) {
+                        const rawText = (rawValue || '').toString().trim();
+                        if (!rawText || rawText.length > 120) return;
+
+                        let displayName = null;
+                        const directMatch = rawText.match(/^@?([A-Za-z0-9_-]{3,25})$/);
+                        const labelMatch = rawText.match(
+                            /^@?([A-Za-z0-9_-]{3,25})(?:'s)?\\s+(?:profile|avatar|account)$/i
+                        );
+                        const hrefMatch = rawText.match(/\\/(?:member|user)\\/([A-Za-z0-9_-]{3,25})/i);
+
+                        if (directMatch) displayName = directMatch[1];
+                        else if (labelMatch) displayName = labelMatch[1];
+                        else if (hrefMatch) displayName = hrefMatch[1];
+                        else return;
+
+                        const name = normalizeName(displayName);
+                        if (!name || isGenericUsername(name)) return;
+                        candidates.push({ name, displayName, source, score });
+                    }
+
+                    function readPath(root, path) {
+                        let value = root;
+                        for (const key of path) {
+                            if (value === null || value === undefined) return null;
+                            value = value[key];
+                        }
+                        return value;
+                    }
+
+                    function addUsernamesFromText(candidates, text, source, score) {
+                        const value = (text || '').toString();
+                        if (!value || value.length > 5000) return;
+
+                        const quotedNameRe =
+                            /"(?:username|userName|user_name|login|memberName)"\\s*:\\s*"([A-Za-z0-9_-]{3,25})"/g;
+                        let match = null;
+                        while ((match = quotedNameRe.exec(value)) !== null) {
+                            addUsernameCandidate(candidates, match[1], source, score);
+                        }
+
+                        if (/^[A-Za-z0-9_-]{3,25}$/.test(value)) {
+                            addUsernameCandidate(candidates, value, source, score);
+                        }
+                    }
+
+                    function inferLoggedInUsername() {
+                        const candidates = [];
+
+                        addUsernameCandidate(candidates, botUsername, 'config.username', 100);
+
+                        const globalPaths = [
+                            ['chesscom', 'user', 'username'],
+                            ['chesscom', 'currentUser', 'username'],
+                            ['ChessCom', 'user', 'username'],
+                            ['ChessCom', 'currentUser', 'username'],
+                            ['currentUser', 'username'],
+                            ['user', 'username'],
+                            ['__CHESSCOM_USER__', 'username']
+                        ];
+
+                        for (const path of globalPaths) {
+                            try {
+                                addUsernameCandidate(
+                                    candidates,
+                                    readPath(window, path),
+                                    'window.' + path.join('.'),
+                                    90
+                                );
+                            } catch (e) {}
+                        }
+
+                        const accountSelectors = [
+                            '[data-current-user]',
+                            '[data-logged-in-user]',
+                            '[data-auth-user]',
+                            '[data-user]',
+                            '[data-username][class*="account"]',
+                            '[data-username][class*="profile"]',
+                            '[data-username][class*="menu"]',
+                            '[class*="user-menu"] [data-username]',
+                            '[class*="user-menu"] a[href*="/member/"]',
+                            '[class*="profile"] a[href*="/member/"]',
+                            '[aria-label*="profile" i][href*="/member/"]',
+                            '[title*="profile" i][href*="/member/"]'
+                        ];
+
+                        for (const selector of accountSelectors) {
+                            try {
+                                for (const el of document.querySelectorAll(selector)) {
+                                    addUsernameCandidate(
+                                        candidates,
+                                        el.getAttribute('data-current-user') ||
+                                            el.getAttribute('data-logged-in-user') ||
+                                            el.getAttribute('data-auth-user') ||
+                                            el.getAttribute('data-user') ||
+                                            el.getAttribute('data-username') ||
+                                            el.getAttribute('data-user-name') ||
+                                            el.getAttribute('aria-label') ||
+                                            el.getAttribute('title') ||
+                                            el.textContent,
+                                        'account-dom:' + selector,
+                                        75
+                                    );
+
+                                    const href = el.getAttribute('href') || '';
+                                    const hrefMatch = href.match(/\\/(?:member|user)\\/([^/?#]+)/i);
+                                    if (hrefMatch) {
+                                        try {
+                                            addUsernameCandidate(
+                                                candidates,
+                                                decodeURIComponent(hrefMatch[1]),
+                                                'account-link:' + selector,
+                                                75
+                                            );
+                                        } catch (e) {
+                                            addUsernameCandidate(
+                                                candidates,
+                                                hrefMatch[1],
+                                                'account-link:' + selector,
+                                                75
+                                            );
+                                        }
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+
+                        for (const storageName of ['localStorage', 'sessionStorage']) {
+                            try {
+                                const storage = window[storageName];
+                                if (!storage) continue;
+                                for (let i = 0; i < storage.length; i++) {
+                                    const key = storage.key(i) || '';
+                                    const value = storage.getItem(key) || '';
+                                    if (/user|account|member|auth|profile|login/i.test(key)) {
+                                        addUsernamesFromText(
+                                            candidates,
+                                            value,
+                                            storageName + ':' + key.slice(0, 60),
+                                            85
+                                        );
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+
+                        candidates.sort((a, b) => b.score - a.score);
+                        result.debug.loggedInUsernameCandidates = candidates.slice(0, 6);
+                        return candidates[0] || null;
+                    }
+
+                    const configuredBotName = normalizeName(botUsername);
+                    const inferredBot = inferLoggedInUsername();
+                    if (inferredBot) {
+                        result.botUsername = inferredBot.displayName || inferredBot.name;
+                        result.debug.botUsernameSource = inferredBot.source;
                     }
 
                     const game = board.game;
@@ -427,7 +601,7 @@ class BoardParser:
                         }
                     }
 
-                    const botName = normalizeName(botUsername);
+                    let botName = configuredBotName || normalizeName(result.botUsername);
                     {
                         const boardRect = board.getBoundingClientRect();
                         const boardMidY = boardRect.top + boardRect.height / 2;
@@ -542,6 +716,29 @@ class BoardParser:
                         result.topPlayer = bestPlayerForSide('top');
                         result.bottomPlayer = bestPlayerForSide('bottom');
 
+                        if (!botName) {
+                            const topName = result.topPlayer
+                                ? normalizeName(result.topPlayer.username || result.topPlayer.text)
+                                : '';
+                            const bottomName = result.bottomPlayer
+                                ? normalizeName(result.bottomPlayer.username || result.bottomPlayer.text)
+                                : '';
+                            const topGeneric = isGenericUsername(topName);
+                            const bottomGeneric = isGenericUsername(bottomName);
+
+                            if (topGeneric && bottomName && !bottomGeneric) {
+                                botName = bottomName;
+                                result.botUsername =
+                                    result.bottomPlayer.username || result.bottomPlayer.text;
+                                result.debug.botUsernameSource = 'player-panel-generic-top';
+                            } else if (bottomGeneric && topName && !topGeneric) {
+                                botName = topName;
+                                result.botUsername =
+                                    result.topPlayer.username || result.topPlayer.text;
+                                result.debug.botUsernameSource = 'player-panel-generic-bottom';
+                            }
+                        }
+
                         if (botName) {
                             const matches = playerCandidates.filter(
                                 (candidate) => nameMatches(candidate.normalizedNames, botName)
@@ -618,9 +815,18 @@ class BoardParser:
             return "unknown"
         return player.get("username") or player.get("text") or "unknown"
 
+    def _bot_username_label(self, snapshot):
+        snapshot = snapshot or {}
+        return (
+            snapshot.get("botUsername") or
+            self._detected_username or
+            self.username or
+            "unknown"
+        )
+
     def _log_color_detection(self, snapshot, color_method, orientation_method):
         snapshot = snapshot or {}
-        logger.info("Bot username: %s", self.username or "unknown")
+        logger.info("Bot username: %s", self._bot_username_label(snapshot))
         logger.info("Top player: %s", self._player_label(snapshot.get("topPlayer")))
         logger.info("Bottom player: %s", self._player_label(snapshot.get("bottomPlayer")))
         logger.info(
@@ -646,6 +852,9 @@ class BoardParser:
             snapshot = await self._read_game_controller_snapshot()
 
             if snapshot:
+                if snapshot.get("botUsername"):
+                    self._detected_username = snapshot["botUsername"]
+
                 orientation = snapshot.get("orientation")
                 orientation_method = snapshot.get("orientationMethod")
                 bot_side = snapshot.get("botSide")
