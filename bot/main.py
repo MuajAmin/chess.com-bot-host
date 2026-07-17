@@ -35,6 +35,8 @@ from bot.timing import HumanTiming, build_position_metrics
 from bot.move_maker import MoveMaker
 from bot.game_tracker import GameTracker
 from bot.notifier import Notifier
+from bot.runtime_control import apply_runtime_config_updates
+from bot.telegram_control import TelegramController
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,15 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
             if not await board_parser.is_our_turn():
                 await asyncio.sleep(0.5)
                 continue
+
+            if not await apply_runtime_config_updates(
+                config,
+                engine,
+                context="in-process game",
+            ):
+                final_result = "engine_restart_failed"
+                duration = game_tracker.end_game(final_result)
+                break
 
             # Update clock data for timing model
             clock_data = await board_parser.get_remaining_time()
@@ -393,6 +404,8 @@ async def main():
     # Initialize session manager and notifier
     session = SessionManager(config)
     notifier = Notifier(config)
+    telegram_control = TelegramController(config)
+    await telegram_control.start()
 
     # Handle login based on login_mode
     if config.login_mode == "cookie_only":
@@ -402,6 +415,7 @@ async def main():
             logger.error("Cookie login failed and login_mode='cookie_only'. Exiting.")
             await notifier.error("Cookie login failed. Manual intervention needed.")
             await session.close()
+            await telegram_control.close()
             await notifier.close()
             sys.exit(1)
         logger.info("Logged in via cookies.")
@@ -411,6 +425,7 @@ async def main():
             logger.error("Failed to login. Exiting.")
             await notifier.error("Login failed. Check credentials.")
             await session.close()
+            await telegram_control.close()
             await notifier.close()
             sys.exit(1)
 
@@ -431,6 +446,12 @@ async def main():
 
     try:
         while True:
+            await apply_runtime_config_updates(config, context="listener")
+            if config.server_paused:
+                logger.debug("Challenge listener paused by runtime control.")
+                await asyncio.sleep(max(1, config.check_interval))
+                continue
+
             # Check daily game limit
             if not game_tracker.can_play:
                 await notifier.daily_limit_reached(game_tracker.games_today)
@@ -558,6 +579,7 @@ async def main():
         await notifier.error(f"Fatal error: {e}")
     finally:
         await session.close()
+        await telegram_control.close()
         await notifier.close()
         logger.info("Bot shutdown complete.")
 

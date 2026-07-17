@@ -48,7 +48,19 @@ notifications:
                               # Telegram: https://api.telegram.org/bot<TOKEN>/sendMessage
                               # Discord: https://discord.com/api/webhooks/<ID>/<TOKEN>
 
+control:
+  telegram:
+    enabled: false            # true = accept Telegram Bot API control commands
+    token: "${TELEGRAM_BOT_TOKEN}"  # Optional if webhook_url is Telegram
+    chat_id: "${TELEGRAM_CHAT_ID}"  # Only this chat can control the bot
+    allowed_chat_ids: []      # Optional extra chat IDs
+    poll_interval: 2.0
+    overrides_file: "runtime_control.yaml"
+    weights_dir: "/home/bot/chess.com_bot_host/weights"
+    apply_during_game: true   # restart engine before next move if weights change
+
 server:
+  paused: false               # true = stay logged in but do not accept challenges
   check_interval: 3          # seconds between challenge checks
   max_games_per_day: 5       # daily game limit to avoid suspicion
   cookie_file: "session_cookies.json"

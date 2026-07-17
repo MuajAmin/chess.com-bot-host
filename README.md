@@ -82,7 +82,19 @@ humanizer:
 notifications:
   webhook_url: ""              # Telegram or Discord webhook endpoint URL
 
+control:
+  telegram:
+    enabled: false             # Enable Telegram Bot API control commands
+    token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+    allowed_chat_ids: []
+    poll_interval: 2.0
+    overrides_file: "runtime_control.yaml"
+    weights_dir: "/home/bot/chess.com_bot_host/weights"
+    apply_during_game: true
+
 server:
+  paused: false                # Stay logged in but do not accept challenges
   check_interval: 3            # Seconds between challenge checks
   max_games_per_day: 5         # Daily limit to avoid suspicion
   cookie_file: "session_cookies.json"
@@ -109,6 +121,12 @@ server:
 | **timing** | `critical_delay_max` | `4.5` | Upper delay cap for tactical positions with checks, captures, hanging material, king pressure, or promotions. |
 | **humanizer** | `change_moves` | `false` | Optional legacy behavior that can pick a lower-ranked move. Keep false when move choice must stay unchanged. |
 | **humanizer** | `adjust_engine_time` | `false` | Optional legacy behavior that changes Lc0 search time. Keep false when move choice must stay unchanged. |
+| **control.telegram** | `enabled` | `false` | Enables Telegram Bot API long polling for authorized remote commands. |
+| **control.telegram** | `token` / `chat_id` | `""` | Bot token and authorized control chat. If `webhook_url` is Telegram, these can be omitted and reused from that URL. |
+| **control.telegram** | `overrides_file` | `runtime_control.yaml` | Stores Telegram-made runtime changes separately from `config.yaml`. |
+| **control.telegram** | `weights_dir` | `/home/bot/chess.com_bot_host/weights` | Directory scanned by `/weights`, `/setweights`, and `/strength`. |
+| **control.telegram** | `apply_during_game` | `true` | Lets workers reload changed settings and restart Lc0 before the next move when engine process settings change. |
+| **server** | `paused` | `false` | Stops accepting new challenges while keeping the browser session alive. |
 | **server** | `max_context_games`| `3` | Periodically refreshes the browser window to flush cached assets and prevent Chromium memory growth. |
 | **server** | `worker_timeout_seconds` | `7200` | Prevents a stuck worker subprocess from blocking the main listener forever. |
 | **server** | `browser_no_sandbox` | `false` | Enables Chromium `--no-sandbox` only when explicitly required. Do not use it while running as root. |
@@ -171,6 +189,32 @@ python -m bot.main
 ### Webhook Alerts Format
 - **Discord:** Simply paste your Discord Channel Webhook URL into `webhook_url`.
 - **Telegram:** Use the format `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>` containing your bot token and target chat ID.
+
+### Telegram Remote Control
+Set `control.telegram.enabled: true` and provide a Telegram bot token plus the authorized `chat_id`. If your `notifications.webhook_url` is already a Telegram URL, the controller can reuse its token and chat ID.
+
+Runtime changes are written to `runtime_control.yaml`, which is intentionally separate from `config.yaml`. The main listener reloads this file automatically. Game workers also reload it before engine moves when `apply_during_game` is true, restarting Lc0 only when weights, engine type, backend, threads, or NN cache changed.
+
+Supported commands:
+
+```text
+/status
+/weights
+/setweights <file-or-path> [auto|maia|lc0]
+/strength <1100-1900|fast|normal|strong>
+/setengine <auto|maia|lc0>
+/settime <seconds>
+/setthreads <count>
+/setcache <size>
+/delay <min> <max>
+/blunder <0-100>
+/challenge <open|whitelist>
+/maxgames <count>
+/pause
+/resume
+/reload
+/clearoverrides
+```
 
 ---
 

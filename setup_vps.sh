@@ -189,7 +189,7 @@ EOF
 systemctl daemon-reload
 systemctl enable chess-bot.service
 
-for secret_file in "$BOT_DIR/config.yaml" "$BOT_DIR/session_cookies.json"; do
+for secret_file in "$BOT_DIR/config.yaml" "$BOT_DIR/session_cookies.json" "$BOT_DIR/runtime_control.yaml"; do
     if [ -f "$secret_file" ]; then
         chown "$BOT_USER:$BOT_GROUP" "$secret_file"
         chmod 600 "$secret_file"

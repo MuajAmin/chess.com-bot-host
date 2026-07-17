@@ -29,6 +29,7 @@ from bot.lc0_engine import Lc0Engine
 from bot.timing import HumanTiming, build_position_metrics
 from bot.move_maker import MoveMaker
 from bot.game_tracker import GameTracker
+from bot.runtime_control import apply_runtime_config_updates
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,14 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 continue
             _wait_logged = False
             _wait_count = 0
+
+            if not await apply_runtime_config_updates(
+                config,
+                engine,
+                context="subprocess game",
+            ):
+                game_tracker.end_game("engine_restart_failed")
+                break
 
             # Update clock data for timing model
             clock_data = await board_parser.get_remaining_time()

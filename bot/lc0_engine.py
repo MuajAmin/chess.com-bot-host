@@ -29,7 +29,11 @@ class Lc0Engine:
     def __init__(self, config):
         self.config = config
         self._engine = None
+        self._process_signature = None
         self._is_maia = self._detect_maia()
+
+    def _build_process_signature(self):
+        return self.config.engine_process_signature
 
     def _detect_maia(self):
         """Decide whether to use Maia policy-only mode."""
@@ -49,6 +53,8 @@ class Lc0Engine:
 
     async def start(self):
         """Start the Lc0 engine process."""
+        self._is_maia = self._detect_maia()
+        self._process_signature = self._build_process_signature()
         logger.info("Starting Lc0 engine...")
         logger.info("  Path:    %s", self.config.engine_path)
         logger.info("  Weights: %s", self.config.engine_weights)
@@ -88,10 +94,29 @@ class Lc0Engine:
 
         except FileNotFoundError:
             logger.error("Lc0 binary not found at: %s", self.config.engine_path)
+            self._process_signature = None
             return False
         except Exception as e:
             logger.error("Failed to start Lc0 engine: %s", e)
+            self._process_signature = None
             return False
+
+    async def restart_if_config_changed(self):
+        """
+        Restart Lc0 when process-level settings changed.
+
+        Search time changes do not need a restart; weights, engine type,
+        backend, threads, and NN cache do.
+        """
+        next_signature = self._build_process_signature()
+        if next_signature == self._process_signature:
+            return True
+
+        logger.info("Engine process settings changed; restarting Lc0.")
+        if self.is_running:
+            await self.close()
+        self._process_signature = None
+        return await self.start()
 
     async def get_best_move(self, board, time_limit=None):
         """
