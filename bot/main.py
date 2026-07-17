@@ -92,7 +92,8 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
     move_maker.set_color(board_parser.is_board_white_bottom)
     humanizer.reset()
 
-    color_name = "WHITE" if board_parser.is_white else "BLACK"
+    bot_color = board_parser.bot_color or ("white" if board_parser.is_white else "black")
+    color_name = bot_color.upper()
     board_bottom = "WHITE" if board_parser.is_board_white_bottom else "BLACK"
     logger.info("=" * 50)
     logger.info(
@@ -484,7 +485,8 @@ async def main():
 
                     # Detect color for notification
                     await board_parser.detect_our_color()
-                    color_name = "WHITE" if board_parser.is_white else "BLACK"
+                    bot_color = board_parser.bot_color or ("white" if board_parser.is_white else "black")
+                    color_name = bot_color.upper()
                     await notifier.game_started(color_name)
 
                     try:

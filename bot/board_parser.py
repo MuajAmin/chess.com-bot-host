@@ -57,6 +57,8 @@ class BoardParser:
         self.page = page
         self.username = username or ""
         self._our_color = None
+        self._bot_color = None
+        self._bot_side = None
         self._board_orientation = None
         self._last_fen = None
         self._last_board = None  # Cache full Board object from move replay
@@ -67,6 +69,14 @@ class BoardParser:
     @property
     def our_color(self):
         return self._our_color
+
+    @property
+    def bot_color(self):
+        return self._bot_color
+
+    @property
+    def bot_side(self):
+        return self._bot_side
 
     @property
     def is_white(self):
@@ -81,6 +91,40 @@ class BoardParser:
         if self._board_orientation is None:
             return self.is_white
         return self._board_orientation == chess.WHITE
+
+    def _set_colors(self, bot_color=None, board_orientation=None, bot_side=None):
+        if bot_color in ("white", "black"):
+            self._bot_color = bot_color
+            self._our_color = chess.WHITE if bot_color == "white" else chess.BLACK
+
+        if board_orientation in ("white", "black"):
+            self._board_orientation = (
+                chess.WHITE if board_orientation == "white" else chess.BLACK
+            )
+
+        if bot_side in ("top", "bottom"):
+            self._bot_side = bot_side
+
+    def _color_name(self, color):
+        if color == chess.WHITE:
+            return "white"
+        if color == chess.BLACK:
+            return "black"
+        return "unknown"
+
+    def _opposite_color(self, color):
+        if color == chess.WHITE:
+            return chess.BLACK
+        if color == chess.BLACK:
+            return chess.WHITE
+        return None
+
+    def _current_bot_side(self):
+        if self._bot_side in ("top", "bottom"):
+            return self._bot_side
+        if self._our_color is not None and self._board_orientation is not None:
+            return "bottom" if self._our_color == self._board_orientation else "top"
+        return None
 
     async def wait_for_board_ready(self, timeout_ms=15000):
         """Wait until the playable board is visible enough to parse and click."""
@@ -123,6 +167,9 @@ class BoardParser:
                         colorMethod: null,
                         orientation: null,
                         orientationMethod: null,
+                        botSide: null,
+                        topPlayer: null,
+                        bottomPlayer: null,
                         turn: null,
                         fen: null,
                         debug: {}
@@ -313,6 +360,31 @@ class BoardParser:
                     }
 
                     if (!result.orientation) {
+                        const boardClass = (
+                            board.getAttribute('class') ||
+                            board.className ||
+                            ''
+                        ).toString().toLowerCase();
+                        result.debug.boardClass = boardClass.slice(0, 200);
+
+                        if (
+                            board.hasAttribute('flipped') ||
+                            boardClass.includes('flipped') ||
+                            boardClass.includes('orientation-black') ||
+                            boardClass.includes('black-bottom')
+                        ) {
+                            result.orientation = 'black';
+                            result.orientationMethod = 'board.class-flipped';
+                        } else if (
+                            boardClass.includes('orientation-white') ||
+                            boardClass.includes('white-bottom')
+                        ) {
+                            result.orientation = 'white';
+                            result.orientationMethod = 'board.class-orientation';
+                        }
+                    }
+
+                    if (!result.orientation) {
                         const coordEls = board.querySelectorAll(
                             '[class*="coordinate"], [class*="notation"], ' +
                             '.coords-rank text, .coords-rank span, ' +
@@ -335,8 +407,28 @@ class BoardParser:
                         }
                     }
 
+                    if (!result.orientation) {
+                        const pieces = board.querySelectorAll('.piece');
+                        let wkY = null;
+                        let bkY = null;
+                        for (const piece of pieces) {
+                            const cls = (piece.className || '').toString();
+                            const rect = piece.getBoundingClientRect();
+                            const midY = rect.top + rect.height / 2;
+                            if (cls.includes('wk')) wkY = midY;
+                            if (cls.includes('bk')) bkY = midY;
+                        }
+                        result.debug.whiteKingY = wkY;
+                        result.debug.blackKingY = bkY;
+
+                        if (wkY !== null && bkY !== null) {
+                            result.orientation = wkY > bkY ? 'white' : 'black';
+                            result.orientationMethod = 'king-screen-position';
+                        }
+                    }
+
                     const botName = normalizeName(botUsername);
-                    if (!result.color && botName && result.orientation) {
+                    {
                         const boardRect = board.getBoundingClientRect();
                         const boardMidY = boardRect.top + boardRect.height / 2;
                         const leftLimit = boardRect.left - boardRect.width * 0.8;
@@ -344,10 +436,11 @@ class BoardParser:
                         const topLimit = boardRect.top - boardRect.height * 0.8;
                         const bottomLimit = boardRect.bottom + boardRect.height * 0.8;
 
-                        function namesForElement(el) {
-                            const values = [
+                        function playerNameData(el) {
+                            const rawValues = [
                                 el.getAttribute('data-username'),
                                 el.getAttribute('data-player-username'),
+                                el.getAttribute('data-user-name'),
                                 el.getAttribute('username'),
                                 el.getAttribute('aria-label'),
                                 el.getAttribute('title'),
@@ -355,8 +448,20 @@ class BoardParser:
                             ];
                             const href = el.getAttribute('href') || '';
                             const hrefMatch = href.match(/\\/(?:member|user)\\/([^/?#]+)/i);
-                            if (hrefMatch) values.push(hrefMatch[1]);
-                            return values.map(normalizeName).filter(Boolean);
+                            if (hrefMatch) {
+                                try {
+                                    rawValues.push(decodeURIComponent(hrefMatch[1]));
+                                } catch (e) {
+                                    rawValues.push(hrefMatch[1]);
+                                }
+                            }
+
+                            const names = rawValues.map(normalizeName).filter(Boolean);
+                            const displayName = rawValues
+                                .map((value) => (value || '').toString().trim())
+                                .find((value) => normalizeName(value)) || '';
+
+                            return { names, displayName };
                         }
 
                         function nameMatches(names, target) {
@@ -370,15 +475,19 @@ class BoardParser:
                         const playerSelectors = [
                             '[data-username]',
                             '[data-player-username]',
+                            '[data-user-name]',
                             '.user-username',
+                            '.user-username-component',
+                            '[class*="user-username"]',
                             '[class*="username"]',
+                            '[class*="user-name"]',
                             '[class*="player"] a[href*="/member/"]',
                             '[class*="player"] a[href*="/user/"]',
                             'a[href*="/member/"]',
                             'a[href*="/user/"]'
                         ];
                         const seenPlayers = new Set();
-                        const matches = [];
+                        const playerCandidates = [];
 
                         for (const selector of playerSelectors) {
                             for (const el of document.querySelectorAll(selector)) {
@@ -396,28 +505,68 @@ class BoardParser:
                                     continue;
                                 }
 
-                                const names = namesForElement(el);
-                                if (!nameMatches(names, botName)) continue;
+                                const nameData = playerNameData(el);
+                                if (nameData.names.length === 0) continue;
 
-                                matches.push({
-                                    text: (el.textContent || '').trim().slice(0, 80),
+                                const side = midY > boardMidY ? 'bottom' : 'top';
+                                const distance = side === 'bottom'
+                                    ? Math.abs(rect.top - boardRect.bottom)
+                                    : Math.abs(boardRect.top - rect.bottom);
+
+                                playerCandidates.push({
+                                    username: nameData.displayName.slice(0, 80),
+                                    normalizedNames: nameData.names.slice(0, 4),
+                                    text: (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120),
                                     tagName: el.tagName,
                                     className: (el.className || '').toString().slice(0, 120),
-                                    side: midY > boardMidY ? 'bottom' : 'top',
-                                    distance: Math.abs(midY - boardMidY)
+                                    side,
+                                    distance
                                 });
                             }
                         }
 
-                        matches.sort((a, b) => a.distance - b.distance);
-                        result.debug.playerIdentityMatches = matches.slice(0, 4);
+                        playerCandidates.sort((a, b) => a.distance - b.distance);
+                        result.debug.playerCandidates = playerCandidates.slice(0, 8);
 
-                        if (matches.length > 0) {
-                            const side = matches[0].side;
-                            result.color = side === 'bottom'
-                                ? result.orientation
-                                : oppositeColor(result.orientation);
-                            result.colorMethod = 'player-panel-username';
+                        function bestPlayerForSide(side) {
+                            const player = playerCandidates.find((candidate) => candidate.side === side);
+                            if (!player) return null;
+                            return {
+                                username: player.username || player.normalizedNames[0] || '',
+                                side: player.side,
+                                text: player.text,
+                                className: player.className
+                            };
+                        }
+
+                        result.topPlayer = bestPlayerForSide('top');
+                        result.bottomPlayer = bestPlayerForSide('bottom');
+
+                        if (botName) {
+                            const matches = playerCandidates.filter(
+                                (candidate) => nameMatches(candidate.normalizedNames, botName)
+                            );
+                            matches.sort((a, b) => a.distance - b.distance);
+                            result.debug.playerIdentityMatches = matches.slice(0, 4);
+
+                            if (matches.length > 0) {
+                                const side = matches[0].side;
+                                result.botSide = side;
+
+                                if (!result.color && result.orientation) {
+                                    result.color = side === 'bottom'
+                                        ? result.orientation
+                                        : oppositeColor(result.orientation);
+                                    result.colorMethod = 'player-panel-username';
+                                }
+
+                                if (!result.orientation && result.color) {
+                                    result.orientation = side === 'bottom'
+                                        ? result.color
+                                        : oppositeColor(result.color);
+                                    result.orientationMethod = 'player-panel-username+color';
+                                }
+                            }
                         }
                     }
 
@@ -435,219 +584,116 @@ class BoardParser:
             logger.debug("Game controller snapshot failed: %s", e)
             return None
 
+    async def wait_for_game_identity_ready(self, timeout_ms=15000):
+        """Wait for the board plus enough player/orientation data to detect color."""
+        started_at = time.monotonic()
+        board_ready = await self.wait_for_board_ready(timeout_ms=timeout_ms)
+        if not board_ready:
+            return False
+
+        remaining = max(1.0, (timeout_ms / 1000) - (time.monotonic() - started_at))
+        deadline = time.monotonic() + remaining
+        last_debug = None
+
+        while time.monotonic() < deadline:
+            snapshot = await self._read_game_controller_snapshot()
+            if snapshot:
+                last_debug = snapshot.get("debug", {})
+                has_board = bool(snapshot.get("selector"))
+                has_direct_color = snapshot.get("color") in ("white", "black")
+                has_orientation = snapshot.get("orientation") in ("white", "black")
+                has_player_info = bool(snapshot.get("topPlayer") or snapshot.get("bottomPlayer"))
+                has_bot_side = snapshot.get("botSide") in ("top", "bottom")
+
+                if has_board and (has_direct_color or (has_orientation and has_player_info) or has_bot_side):
+                    return True
+
+            await asyncio.sleep(0.25)
+
+        logger.warning("Player/orientation info did not fully load before timeout: %s", last_debug)
+        return False
+
+    def _player_label(self, player):
+        if not player:
+            return "unknown"
+        return player.get("username") or player.get("text") or "unknown"
+
+    def _log_color_detection(self, snapshot, color_method, orientation_method):
+        snapshot = snapshot or {}
+        logger.info("Bot username: %s", self.username or "unknown")
+        logger.info("Top player: %s", self._player_label(snapshot.get("topPlayer")))
+        logger.info("Bottom player: %s", self._player_label(snapshot.get("bottomPlayer")))
+        logger.info(
+            "Board orientation: %s bottom (method: %s)",
+            self._color_name(self._board_orientation),
+            orientation_method or "unknown",
+        )
+        logger.info(
+            "Detected bot color: %s (method: %s, bot side: %s)",
+            self._bot_color or self._color_name(self._our_color),
+            color_method or "unknown",
+            self._bot_side or "unknown",
+        )
+
     async def detect_our_color(self):
-        """Detect which color we are playing.
+        """Detect which color the bot is playing without assuming White is bottom."""
+        snapshot = None
+        color_method = None
+        orientation_method = None
 
-        Uses multiple strategies in order of reliability:
-        1. Game controller options, matching Mint.js
-        2. Board coordinate labels (which rank is at bottom)
-        3. Piece position on the board (king file positions)
-        4. Clock/player panel color classes
-        5. Board flipped attribute/class
-        6. Default to WHITE (last resort)
-        """
         try:
-            await self.wait_for_board_ready()
+            await self.wait_for_game_identity_ready()
+            snapshot = await self._read_game_controller_snapshot()
 
-            controller_result = await self._read_game_controller_snapshot()
-            if controller_result and controller_result.get("orientation") in ("white", "black"):
-                self._board_orientation = (
-                    chess.WHITE if controller_result["orientation"] == "white" else chess.BLACK
-                )
+            if snapshot:
+                orientation = snapshot.get("orientation")
+                orientation_method = snapshot.get("orientationMethod")
+                bot_side = snapshot.get("botSide")
+                bot_color = snapshot.get("color")
+                color_method = snapshot.get("colorMethod")
 
-            if controller_result and controller_result.get("color") in ("white", "black"):
-                self._our_color = (
-                    chess.WHITE if controller_result["color"] == "white" else chess.BLACK
-                )
-                logger.info(
-                    "Detected: Playing as %s (method: %s, board_bottom: %s, debug: %s)",
-                    "WHITE" if self._our_color == chess.WHITE else "BLACK",
-                    controller_result.get("colorMethod", "game-controller"),
-                    "WHITE" if self.is_board_white_bottom else "BLACK",
-                    controller_result.get("debug", {}),
-                )
-                return self._our_color
+                if bot_color not in ("white", "black"):
+                    if orientation in ("white", "black") and bot_side in ("top", "bottom"):
+                        bot_color = (
+                            orientation
+                            if bot_side == "bottom"
+                            else ("black" if orientation == "white" else "white")
+                        )
+                        color_method = "board-orientation+username-position"
 
-            color_result = await self.page.evaluate("""
-                () => {
-                    const result = {
-                        method: null,
-                        color: null,
-                        debug: {}
-                    };
+                if orientation not in ("white", "black"):
+                    if bot_color in ("white", "black") and bot_side in ("top", "bottom"):
+                        orientation = (
+                            bot_color
+                            if bot_side == "bottom"
+                            else ("black" if bot_color == "white" else "white")
+                        )
+                        orientation_method = "bot-color+username-position"
 
-                    // ── Strategy 0: Game controller API (from Mint.js) ──
-                    // Chess.com's wc-chess-board has a .game controller with
-                    // getOptions() that returns { isPlayerBlack, flipped, ... }
-                    // This is the MOST RELIABLE method — same as Mint.js uses.
-                    const wcBoard = document.querySelector('wc-chess-board, chess-board');
-                    if (wcBoard && wcBoard.game) {
-                        try {
-                            const opts = wcBoard.game.getOptions
-                                ? wcBoard.game.getOptions()
-                                : null;
-                            if (opts) {
-                                result.debug.isPlayerBlack = opts.isPlayerBlack;
-                                result.debug.isWhiteOnBottom = opts.isWhiteOnBottom;
-                                result.debug.flipped = opts.flipped;
+                if bot_color in ("white", "black"):
+                    # bot_color is intentionally kept as a string for debug/use by callers.
+                    self._set_colors(bot_color=bot_color, board_orientation=orientation, bot_side=bot_side)
 
-                                if (typeof opts.isPlayerBlack === 'boolean') {
-                                    result.method = 'game-controller-isPlayerBlack';
-                                    result.color = opts.isPlayerBlack ? 'black' : 'white';
-                                    return result;
-                                }
-                            }
-                        } catch(e) {
-                            result.debug.gameControllerError = e.message;
-                        }
-                    }
+                    if self._board_orientation is None:
+                        self._set_colors(board_orientation=bot_color)
+                        orientation_method = orientation_method or "bot-color-fallback"
 
-                    // ── Strategy 1: wc-chess-board component orientation ──
-                    if (wcBoard) {
-                        // Check the 'flipped' property (boolean on the custom element)
-                        if (typeof wcBoard.flipped === 'boolean') {
-                            result.method = 'wc-chess-board.flipped';
-                            result.color = wcBoard.flipped ? 'black' : 'white';
-                            result.debug.flippedProp = wcBoard.flipped;
-                            return result;
-                        }
+                    self._log_color_detection(snapshot, color_method, orientation_method)
+                    return self._our_color
 
-                        // Check the 'orientation' property
-                        const orient = wcBoard.orientation ||
-                                       wcBoard.getAttribute('orientation') || '';
-                        if (orient) {
-                            result.debug.orientation = orient;
-                            if (orient.toLowerCase() === 'black') {
-                                result.method = 'wc-chess-board.orientation';
-                                result.color = 'black';
-                                return result;
-                            } else if (orient.toLowerCase() === 'white') {
-                                result.method = 'wc-chess-board.orientation';
-                                result.color = 'white';
-                                return result;
-                            }
-                        }
-                    }
-
-                    // ── Strategy 2: Board coordinate labels ──
-                    const board = wcBoard || document.querySelector(
-                        'chess-board, .board, #board-single'
-                    );
-                    if (board) {
-                        const boardRect = board.getBoundingClientRect();
-                        const boardMid = boardRect.top + boardRect.height / 2;
-
-                        const coordEls = board.querySelectorAll(
-                            '[class*="coordinate"], [class*="notation"], ' +
-                            '.coords-rank text, .coords-rank span, ' +
-                            'svg text, .board-coordinates span'
-                        );
-
-                        let rank1Y = null, rank8Y = null;
-                        for (const el of coordEls) {
-                            const txt = (el.textContent || '').trim();
-                            const rect = el.getBoundingClientRect();
-                            const midY = rect.top + rect.height / 2;
-                            if (txt === '1') rank1Y = midY;
-                            if (txt === '8') rank8Y = midY;
-                        }
-                        result.debug.rank1Y = rank1Y;
-                        result.debug.rank8Y = rank8Y;
-
-                        if (rank1Y !== null && rank8Y !== null) {
-                            if (rank1Y > rank8Y) {
-                                result.method = 'coordinates';
-                                result.color = 'white';
-                                return result;
-                            } else {
-                                result.method = 'coordinates';
-                                result.color = 'black';
-                                return result;
-                            }
-                        }
-                    }
-
-                    // ── Strategy 3: Piece positions (king Y comparison) ──
-                    if (board) {
-                        const pieces = board.querySelectorAll('.piece');
-                        let wkY = null, bkY = null;
-                        for (const p of pieces) {
-                            const cls = (p.className || '').toString();
-                            const rect = p.getBoundingClientRect();
-                            const midY = rect.top + rect.height / 2;
-                            if (cls.includes('wk')) wkY = midY;
-                            if (cls.includes('bk')) bkY = midY;
-                        }
-                        result.debug.wkY = wkY;
-                        result.debug.bkY = bkY;
-
-                        if (wkY !== null && bkY !== null) {
-                            if (wkY > bkY) {
-                                result.method = 'king-position';
-                                result.color = 'white';
-                                return result;
-                            } else {
-                                result.method = 'king-position';
-                                result.color = 'black';
-                                return result;
-                            }
-                        }
-                    }
-
-                    // ── Strategy 4: Board flipped attribute/class ──
-                    if (board) {
-                        const norm = (v) => (v || '').toString().trim().toLowerCase();
-                        const cls = norm(board.getAttribute('class') || board.className);
-                        const hasFlipped = board.hasAttribute('flipped');
-                        result.debug.boardClasses = cls.substring(0, 200);
-                        result.debug.hasFlippedAttr = hasFlipped;
-
-                        if (
-                            hasFlipped ||
-                            cls.includes('flipped') ||
-                            cls.includes('orientation-black') ||
-                            cls.includes('black-bottom')
-                        ) {
-                            result.method = 'board-flipped-class';
-                            result.color = 'black';
-                            return result;
-                        }
-                    }
-
-                    // ── No strategy succeeded ──
-                    return result;
-                }
-            """)
-
-            if color_result and color_result.get("color") in ("white", "black"):
-                self._our_color = (
-                    chess.WHITE if color_result["color"] == "white" else chess.BLACK
-                )
-                self._board_orientation = self._our_color
-                logger.info(
-                    "Detected: Playing as %s (method: %s, board_bottom: %s, debug: %s)",
-                    "WHITE" if self._our_color == chess.WHITE else "BLACK",
-                    color_result.get("method", "unknown"),
-                    "WHITE" if self.is_board_white_bottom else "BLACK",
-                    color_result.get("debug", {}),
-                )
-                return self._our_color
-
-            # No strategy worked — log diagnostic info and default to WHITE
             logger.warning(
-                "Color detection: ALL strategies failed! Debug: %s. "
-                "Defaulting to WHITE.",
-                color_result.get("debug", {}) if color_result else "no result",
+                "Color detection: all strategies failed. Defaulting to WHITE. Snapshot: %s",
+                snapshot,
             )
-            self._our_color = chess.WHITE
-            self._board_orientation = chess.WHITE
-            return chess.WHITE
+            self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
+            self._log_color_detection(snapshot, "default-white", "default-white")
+            return self._our_color
 
         except Exception as e:
             logger.warning("Color detection failed, defaulting to WHITE: %s", e)
-            self._our_color = chess.WHITE
-            self._board_orientation = chess.WHITE
-            return chess.WHITE
+            self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
+            self._log_color_detection(snapshot, "exception-default-white", "exception-default-white")
+            return self._our_color
 
     async def get_board_fen(self):
         """
@@ -1479,10 +1525,22 @@ class BoardParser:
             """)
 
             if turn_data:
+                bottom_color = self._board_orientation
+                if bottom_color is None and self._our_color is not None:
+                    bot_side = self._current_bot_side()
+                    if bot_side == "bottom":
+                        bottom_color = self._our_color
+                    elif bot_side == "top":
+                        bottom_color = self._opposite_color(self._our_color)
+
+                top_color = self._opposite_color(bottom_color)
+
                 if turn_data.get("bottomActive"):
-                    return self._our_color
+                    if bottom_color is not None:
+                        return bottom_color
                 elif turn_data.get("topActive"):
-                    return chess.BLACK if self._our_color == chess.WHITE else chess.WHITE
+                    if top_color is not None:
+                        return top_color
 
             # Method 3: Count only text that looks like an actual move.
             raw_moves = await self.page.evaluate("""
@@ -1613,12 +1671,16 @@ class BoardParser:
 
                     if (clocks.length < 2) return null;
 
-                    // Bottom clock = our clock, Top clock = opponent's clock
                     const bottom = clocks.find(c => c.isBottom);
                     const top = clocks.find(c => !c.isBottom);
 
                     if (bottom && top) {
-                        return { our_time: bottom.seconds, opp_time: top.seconds };
+                        return {
+                            bottom_time: bottom.seconds,
+                            top_time: top.seconds,
+                            bottom_text: bottom.text,
+                            top_text: top.text
+                        };
                     }
 
                     return null;
@@ -1626,11 +1688,21 @@ class BoardParser:
             """)
 
             if clock_data:
+                bot_side = self._current_bot_side()
+                if bot_side == "top":
+                    our_time = clock_data["top_time"]
+                    opp_time = clock_data["bottom_time"]
+                else:
+                    if bot_side is None:
+                        logger.debug("Bot side unknown while reading clocks; using bottom clock fallback.")
+                    our_time = clock_data["bottom_time"]
+                    opp_time = clock_data["top_time"]
+
                 logger.debug(
-                    "Clock: our=%.1fs, opp=%.1fs",
-                    clock_data["our_time"], clock_data["opp_time"],
+                    "Clock: our=%.1fs, opp=%.1fs (bot_side=%s)",
+                    our_time, opp_time, bot_side or "bottom-fallback",
                 )
-                return clock_data
+                return {"our_time": our_time, "opp_time": opp_time}
 
             return None
 
