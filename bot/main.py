@@ -110,6 +110,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
     last_move_key = None       # (fen, uci) of last move we played
     repeat_move_count = 0      # how many times we've tried the same move
     MAX_REPEAT_MOVES = 3       # abort after this many identical attempts
+    last_not_our_turn_fen = None
 
     while True:
         try:
@@ -154,6 +155,21 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 await asyncio.sleep(1)
                 continue
 
+            if board_parser.our_color is not None and board.turn != board_parser.our_color:
+                fen = board.fen()
+                if fen != last_not_our_turn_fen:
+                    logger.info(
+                        "Parsed board says %s to move, but we are %s. Waiting for opponent.",
+                        "WHITE" if board.turn else "BLACK",
+                        "WHITE" if board_parser.our_color else "BLACK",
+                    )
+                    last_not_our_turn_fen = fen
+                last_move_key = None
+                repeat_move_count = 0
+                await asyncio.sleep(0.5)
+                continue
+            last_not_our_turn_fen = None
+
             metrics = build_position_metrics(board)
             if metrics["legal_move_count"] == 0:
                 logger.info("No legal moves available.")
@@ -193,17 +209,12 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 if repeat_move_count >= MAX_REPEAT_MOVES:
                     logger.error(
                         "Same move %s attempted %d times on same position — "
-                        "board parsing likely stuck. Treating as error.",
+                        "board parsing likely stuck. Aborting game worker.",
                         move.uci(), repeat_move_count,
                     )
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_errors:
-                        logger.error("Too many errors. Aborting game.")
-                        final_result = "error"
-                        duration = game_tracker.end_game(final_result)
-                        break
-                    await asyncio.sleep(2)
-                    continue
+                    final_result = "error"
+                    duration = game_tracker.end_game(final_result)
+                    break
             else:
                 last_move_key = move_key
                 repeat_move_count = 1
