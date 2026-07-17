@@ -721,20 +721,40 @@ class BoardParser:
                         result.debug.orientationRank1Y = rank1Y;
                         result.debug.orientationRank8Y = rank8Y;
 
-                        // Always check king positions — pieces reflect the
-                        // actual rendered state even during board flip animation
-                        const pieces = board.querySelectorAll('.piece');
+                        // Search for pieces in shadow DOM, board children, then document
+                        const pieceRoot = board.shadowRoot || board;
+                        let pieces = pieceRoot.querySelectorAll('.piece');
+                        if (!pieces || pieces.length === 0) {
+                            pieces = document.querySelectorAll('.piece');
+                        }
+                        result.debug.pieceCount = pieces ? pieces.length : 0;
+
                         let wkY = null;
                         let bkY = null;
+                        const boardRect = board.getBoundingClientRect();
+                        const boardMidY = boardRect.top + boardRect.height / 2;
+                        let bottomWhitePieces = 0;
+                        let bottomBlackPieces = 0;
+
                         for (const piece of pieces) {
                             const cls = (piece.className || '').toString();
                             const rect = piece.getBoundingClientRect();
                             const midY = rect.top + rect.height / 2;
+
+                            // Track king positions
                             if (cls.includes('wk')) wkY = midY;
                             if (cls.includes('bk')) bkY = midY;
+
+                            // Count piece colors in bottom half of board
+                            if (midY > boardMidY) {
+                                if (/\bw[pnbrqk]\b/.test(cls)) bottomWhitePieces++;
+                                if (/\bb[pnbrqk]\b/.test(cls)) bottomBlackPieces++;
+                            }
                         }
                         result.debug.whiteKingY = wkY;
                         result.debug.blackKingY = bkY;
+                        result.debug.bottomWhitePieces = bottomWhitePieces;
+                        result.debug.bottomBlackPieces = bottomBlackPieces;
 
                         // Derive orientation from coordinates and kings
                         const coordOrientation = (rank1Y !== null && rank8Y !== null)
@@ -743,22 +763,35 @@ class BoardParser:
                         const kingOrientation = (wkY !== null && bkY !== null)
                             ? (wkY > bkY ? 'white' : 'black')
                             : null;
+                        // Piece-color method: which color has more pieces at bottom?
+                        const pieceColorOrientation =
+                            (bottomWhitePieces > 0 || bottomBlackPieces > 0)
+                                ? (bottomWhitePieces >= bottomBlackPieces ? 'white' : 'black')
+                                : null;
+
                         result.debug.coordOrientation = coordOrientation;
                         result.debug.kingOrientation = kingOrientation;
+                        result.debug.pieceColorOrientation = pieceColorOrientation;
 
-                        // Prefer king positions over coordinate labels:
-                        // Piece positions always match the visual board state,
-                        // while coordinate labels can lag during board flip animation
+                        // Priority: king positions > piece-color-at-bottom > coordinates
+                        // King positions and piece colors reflect the ACTUAL rendered
+                        // board state, while coordinate labels can lag during board flip.
                         if (kingOrientation) {
                             result.orientation = kingOrientation;
                             result.orientationMethod = 'king-screen-position';
-                            if (coordOrientation && coordOrientation !== kingOrientation) {
-                                result.debug.orientationConflict =
-                                    'coords=' + coordOrientation + ' vs kings=' + kingOrientation;
-                            }
+                        } else if (pieceColorOrientation) {
+                            result.orientation = pieceColorOrientation;
+                            result.orientationMethod = 'piece-colors-at-bottom';
                         } else if (coordOrientation) {
                             result.orientation = coordOrientation;
                             result.orientationMethod = 'coordinates';
+                        }
+
+                        // Log conflicts for diagnostics
+                        const methods = { coords: coordOrientation, kings: kingOrientation, pieceColors: pieceColorOrientation };
+                        const unique = new Set(Object.values(methods).filter(Boolean));
+                        if (unique.size > 1) {
+                            result.debug.orientationConflict = JSON.stringify(methods);
                         }
                     }
 
