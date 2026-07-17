@@ -26,12 +26,18 @@ engine:
   time_per_move: 1.5         # seconds — only used for non-Maia weights
   # Maia weights auto-detected: uses nodes=1 (instant, zero CPU spike)
 
-humanizer:
+timing:
   enabled: true
   delay_min: 0.3             # minimum delay before move (seconds)
   delay_max: 1.5             # maximum delay before move (seconds)
-  blunder_chance: 0.08       # 8% chance of suboptimal move
   premove_chance: 0.05       # 5% chance of near-instant move
+
+humanizer:
+  # Optional move-changing behavior. Keep disabled if the engine move should
+  # stay exactly the same and only the timing should feel human.
+  change_moves: false
+  adjust_engine_time: false
+  blunder_chance: 0.0        # only used when change_moves is true
   rating_mimic: 1800         # target rating to mimic
 
 notifications:

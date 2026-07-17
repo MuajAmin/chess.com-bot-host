@@ -20,7 +20,7 @@ Here is the architectural workflow of the host and game-specific subprocess comm
 | :--- | :--- | :--- |
 | **Engine Lifecycle** | On-demand allocation | Lc0 is initialized at game start and terminated instantly upon game completion. |
 | **Memory Isolation** | CDP subprocess structure | Game operations run inside a subprocess through a localhost Chrome DevTools endpoint. Prevents engine memory fragmentation. |
-| **Humanized Delays** | Clock-aware timing models | Delay timings dynamically scale with time control type, remaining time ratios, and complexity. |
+| **Human-Like Timing** | Clock-aware delay model | Delay timings dynamically scale with time control, clock pressure, opponent speed, and position complexity without changing the selected engine move. |
 | **Position Reading** | Multi-layered parsing | Reconstructs boards via move-list SAN replay. Falls back to DOM attributes and JS state variables. |
 | **Session Control** | Cookie state persistence | Persists active browser authentication contexts to bypass repetitive credential verification. |
 | **System Alerts** | Discord and Telegram push | Publishes game results, starts, daily limits, and warning logs via non-blocking async HTTP POST. |
@@ -64,12 +64,16 @@ engine:
   nn_cache_size: 10000
   time_per_move: 1.5           # Only used if type is "lc0"
 
-humanizer:
+timing:
   enabled: true
   delay_min: 0.3               # Minimum base delay (seconds)
   delay_max: 1.5               # Maximum base delay (seconds)
-  blunder_chance: 0.08         # 8% baseline blunder rate
   premove_chance: 0.05         # 5% baseline premove rate
+
+humanizer:
+  change_moves: false          # Keep false to preserve the exact engine move
+  adjust_engine_time: false    # Keep false to avoid changing Lc0 search time
+  blunder_chance: 0.0          # Only used when change_moves is true
   rating_mimic: 1800
 
 notifications:
@@ -95,7 +99,10 @@ server:
 | :--- | :--- | :--- | :--- |
 | **account** | `login_mode` | `auto` | `cookie_only` bypasses credential entry. `credentials` skips cookie checks. `auto` tries cookies first, then credentials. |
 | **engine** | `type` | `auto` | `maia` forces policy-only `nodes=1`; `lc0` forces time-based search; `auto` checks the weights filename for "maia". |
-| **humanizer** | `rating_mimic` | `1800` | Adjusts blunder selection criteria and search depth constraints to match target play strength. |
+| **timing** | `enabled` | `true` | Enables human-like delays while preserving the exact engine move. |
+| **timing** | `delay_min` / `delay_max` | `0.3` / `1.5` | Normal delay range used by the timing model. Fast premove-style replies may be shorter when the move is forced or obvious. |
+| **humanizer** | `change_moves` | `false` | Optional legacy behavior that can pick a lower-ranked move. Keep false when move choice must stay unchanged. |
+| **humanizer** | `adjust_engine_time` | `false` | Optional legacy behavior that changes Lc0 search time. Keep false when move choice must stay unchanged. |
 | **server** | `max_context_games`| `3` | Periodically refreshes the browser window to flush cached assets and prevent Chromium memory growth. |
 | **server** | `worker_timeout_seconds` | `7200` | Prevents a stuck worker subprocess from blocking the main listener forever. |
 | **server** | `browser_no_sandbox` | `false` | Enables Chromium `--no-sandbox` only when explicitly required. Do not use it while running as root. |

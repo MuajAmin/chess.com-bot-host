@@ -26,7 +26,7 @@ from playwright.async_api import async_playwright
 from bot.config import Config
 from bot.board_parser import BoardParser
 from bot.lc0_engine import Lc0Engine
-from bot.humanizer import Humanizer, build_position_metrics
+from bot.timing import HumanTiming, build_position_metrics
 from bot.move_maker import MoveMaker
 from bot.game_tracker import GameTracker
 
@@ -142,7 +142,7 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
     logger.info("GAME STARTED — Playing as %s (subprocess worker)", color_name)
     logger.info("=" * 50)
 
-    # Detect time control and feed to humanizer
+    # Detect time control and feed to timing model
     tc_data = await board_parser.detect_time_control()
     if tc_data:
         humanizer.set_time_control(tc_data["base_time"], tc_data["increment"])
@@ -150,6 +150,9 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
     game_tracker.start_game()
     consecutive_errors = 0
     max_errors = 10
+    last_move_key = None       # (fen, uci) of last move we played
+    repeat_move_count = 0      # how many times we've tried the same move
+    MAX_REPEAT_MOVES = 3       # abort after this many identical attempts
 
     while True:
         try:
@@ -166,7 +169,7 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 await asyncio.sleep(0.5)
                 continue
 
-            # Update clock data for humanizer
+            # Update clock data for timing model
             clock_data = await board_parser.get_remaining_time()
             if clock_data:
                 humanizer.update_clocks(
@@ -200,7 +203,7 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
 
             consecutive_errors = 0
 
-            # Decide: blunder or best move?
+            # Decide: optional move change or best engine move
             if humanizer.should_blunder(board, metrics):
                 time_adj = humanizer.get_engine_time_adjustment(board, metrics)
                 top_moves = await engine.get_top_moves(
@@ -224,7 +227,28 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 await asyncio.sleep(1)
                 continue
 
-            # Apply human-like delay (clock-aware Gaussian distribution)
+            # Guard against replaying the same move on the same position
+            move_key = (board.fen(), move.uci())
+            if move_key == last_move_key:
+                repeat_move_count += 1
+                if repeat_move_count >= MAX_REPEAT_MOVES:
+                    logger.error(
+                        "Same move %s attempted %d times on same position — "
+                        "board parsing likely stuck. Treating as error.",
+                        move.uci(), repeat_move_count,
+                    )
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_errors:
+                        logger.error("Too many errors. Aborting game.")
+                        game_tracker.end_game("error")
+                        break
+                    await asyncio.sleep(2)
+                    continue
+            else:
+                last_move_key = move_key
+                repeat_move_count = 1
+
+            # Apply human-like delay without changing the selected move
             await humanizer.apply_delay(board, metrics)
 
             # Make the move with Bézier mouse movement
@@ -294,7 +318,7 @@ async def worker_main():
             # Initialize game components (all in THIS subprocess)
             board_parser = BoardParser(page)
             engine = Lc0Engine(config)
-            humanizer = Humanizer(config)
+            humanizer = HumanTiming(config)
             move_maker = MoveMaker(page)
             game_tracker = GameTracker(config, page)
 

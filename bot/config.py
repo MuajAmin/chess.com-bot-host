@@ -6,6 +6,7 @@ Loads settings from config.yaml with defaults and validation.
 import os
 import sys
 import logging
+import copy
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -30,13 +31,23 @@ DEFAULTS = {
         "nn_cache_size": 10000,
         "time_per_move": 1.5,
     },
-    "humanizer": {
+    "timing": {
         "enabled": True,
         "delay_min": 0.3,
         "delay_max": 1.5,
-        "blunder_chance": 0.08,
+        "premove_chance": 0.05,
+    },
+    "humanizer": {
+        # Legacy/optional move-changing settings. Keep disabled when the
+        # engine move should stay exactly the same.
+        "enabled": False,
+        "delay_min": 0.3,
+        "delay_max": 1.5,
+        "blunder_chance": 0.0,
         "premove_chance": 0.05,
         "rating_mimic": 1800,
+        "change_moves": False,
+        "adjust_engine_time": False,
     },
     "notifications": {
         "webhook_url": "",  # Telegram/Discord webhook URL (empty = disabled)
@@ -79,10 +90,26 @@ class Config:
 
         # Deep merge: defaults ← user config
         self._data = self._expand_env_values(self._deep_merge(DEFAULTS, user_config))
+        self._apply_legacy_humanizer_timing(user_config)
+
+    def _apply_legacy_humanizer_timing(self, user_config):
+        """
+        Support older config files that used humanizer.* for delay settings.
+        New config files should use timing.* for delay-only behavior.
+        """
+        legacy = user_config.get("humanizer")
+        explicit_timing = isinstance(user_config.get("timing"), dict)
+        if not isinstance(legacy, dict) or explicit_timing:
+            return
+
+        timing = self._data.setdefault("timing", {})
+        for key in ("enabled", "delay_min", "delay_max", "premove_chance"):
+            if key in legacy:
+                timing[key] = self._expand_env_values(legacy[key])
 
     def _deep_merge(self, base, override):
         """Recursively merge override dict into base dict."""
-        result = base.copy()
+        result = copy.deepcopy(base)
         for key, value in override.items():
             if key in result and isinstance(result[key], dict) and isinstance(value, dict):
                 result[key] = self._deep_merge(result[key], value)
@@ -119,6 +146,13 @@ class Config:
             return default
         return parsed if parsed > 0 else default
 
+    @staticmethod
+    def _as_float(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def _validate(self):
         """Validate critical config values."""
         errors = []
@@ -142,8 +176,12 @@ class Config:
             )
         if self.challenge_mode not in ("whitelist", "open"):
             errors.append(f"challenge.mode must be 'whitelist' or 'open', got: {self.challenge_mode}")
-        if self.humanizer_delay_min > self.humanizer_delay_max:
-            errors.append("humanizer.delay_min must be <= humanizer.delay_max")
+        if self.timing_delay_min > self.timing_delay_max:
+            errors.append("timing.delay_min must be <= timing.delay_max")
+        if not 0 <= self.timing_premove_chance <= 1:
+            errors.append("timing.premove_chance must be between 0 and 1")
+        if not 0 <= self.humanizer_blunder_chance <= 1:
+            errors.append("humanizer.blunder_chance must be between 0 and 1")
         if self.worker_timeout_seconds <= 0:
             errors.append("server.worker_timeout_seconds must be > 0")
 
@@ -219,30 +257,55 @@ class Config:
     def engine_time_per_move(self):
         return self._data["engine"]["time_per_move"]
 
-    # --- Humanizer ---
+    # --- Timing ---
+    @property
+    def timing_enabled(self):
+        return self._as_bool(self._data["timing"].get("enabled", True))
+
+    @property
+    def timing_delay_min(self):
+        return self._as_float(self._data["timing"].get("delay_min", 0.3), 0.3)
+
+    @property
+    def timing_delay_max(self):
+        return self._as_float(self._data["timing"].get("delay_max", 1.5), 1.5)
+
+    @property
+    def timing_premove_chance(self):
+        return self._as_float(self._data["timing"].get("premove_chance", 0.05), 0.05)
+
+    # --- Humanizer / legacy compatibility ---
     @property
     def humanizer_enabled(self):
-        return self._data["humanizer"]["enabled"]
+        return self.timing_enabled
 
     @property
     def humanizer_delay_min(self):
-        return self._data["humanizer"]["delay_min"]
+        return self.timing_delay_min
 
     @property
     def humanizer_delay_max(self):
-        return self._data["humanizer"]["delay_max"]
+        return self.timing_delay_max
 
     @property
     def humanizer_blunder_chance(self):
-        return self._data["humanizer"]["blunder_chance"]
+        return self._as_float(self._data["humanizer"].get("blunder_chance", 0.0), 0.0)
 
     @property
     def humanizer_premove_chance(self):
-        return self._data["humanizer"]["premove_chance"]
+        return self.timing_premove_chance
 
     @property
     def humanizer_rating_mimic(self):
-        return self._data["humanizer"]["rating_mimic"]
+        return self._data["humanizer"].get("rating_mimic", 1800)
+
+    @property
+    def humanizer_change_moves(self):
+        return self._as_bool(self._data["humanizer"].get("change_moves", False))
+
+    @property
+    def humanizer_adjust_engine_time(self):
+        return self._as_bool(self._data["humanizer"].get("adjust_engine_time", False))
 
     # --- Server ---
     @property

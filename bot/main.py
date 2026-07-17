@@ -5,7 +5,7 @@ On-demand bot lifecycle:
 1. Login with stealth browser
 2. Listener mode — poll for challenges
 3. Accept challenge → spawn game_worker subprocess (memory isolation)
-4. Worker plays game with humanized moves + clock-aware delays
+4. Worker plays engine moves with clock-aware human timing
 5. Cleanup: subprocess exit frees all Lc0 RAM, recreate browser context
 6. Repeat until daily limit
 
@@ -31,7 +31,7 @@ from bot.session_manager import SessionManager
 from bot.challenge_listener import ChallengeListener
 from bot.board_parser import BoardParser
 from bot.lc0_engine import Lc0Engine
-from bot.humanizer import Humanizer, build_position_metrics
+from bot.timing import HumanTiming, build_position_metrics
 from bot.move_maker import MoveMaker
 from bot.game_tracker import GameTracker
 from bot.notifier import Notifier
@@ -97,7 +97,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
     logger.info("GAME STARTED — Playing as %s (in-process fallback)", color_name)
     logger.info("=" * 50)
 
-    # Detect time control and feed to humanizer
+    # Detect time control and feed to timing model
     tc_data = await board_parser.detect_time_control()
     if tc_data:
         humanizer.set_time_control(tc_data["base_time"], tc_data["increment"])
@@ -107,6 +107,9 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
     max_errors = 10
     final_result = "completed"
     duration = None
+    last_move_key = None       # (fen, uci) of last move we played
+    repeat_move_count = 0      # how many times we've tried the same move
+    MAX_REPEAT_MOVES = 3       # abort after this many identical attempts
 
     while True:
         try:
@@ -124,7 +127,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 await asyncio.sleep(0.5)
                 continue
 
-            # Update clock data for humanizer
+            # Update clock data for timing model
             clock_data = await board_parser.get_remaining_time()
             if clock_data:
                 humanizer.update_clocks(
@@ -159,7 +162,7 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
 
             consecutive_errors = 0
 
-            # Decide: blunder or best move?
+            # Decide: optional move change or best engine move
             if humanizer.should_blunder(board, metrics):
                 time_adj = humanizer.get_engine_time_adjustment(board, metrics)
                 top_moves = await engine.get_top_moves(
@@ -183,7 +186,29 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
                 await asyncio.sleep(1)
                 continue
 
-            # Apply human-like delay (clock-aware Gaussian distribution)
+            # Guard against replaying the same move on the same position
+            move_key = (board.fen(), move.uci())
+            if move_key == last_move_key:
+                repeat_move_count += 1
+                if repeat_move_count >= MAX_REPEAT_MOVES:
+                    logger.error(
+                        "Same move %s attempted %d times on same position — "
+                        "board parsing likely stuck. Treating as error.",
+                        move.uci(), repeat_move_count,
+                    )
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_errors:
+                        logger.error("Too many errors. Aborting game.")
+                        final_result = "error"
+                        duration = game_tracker.end_game(final_result)
+                        break
+                    await asyncio.sleep(2)
+                    continue
+            else:
+                last_move_key = move_key
+                repeat_move_count = 1
+
+            # Apply human-like delay without changing the selected move
             await humanizer.apply_delay(board, metrics)
 
             # Make the move with Bézier mouse movement
@@ -416,7 +441,7 @@ async def main():
                         continue
 
                     board_parser = BoardParser(session.page)
-                    humanizer = Humanizer(config)
+                    humanizer = HumanTiming(config)
                     move_maker = MoveMaker(session.page)
 
                     # Detect color for notification

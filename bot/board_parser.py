@@ -288,6 +288,35 @@ class BoardParser:
                 () => {
                     const moves = [];
 
+                    // Helper: extract only the SAN move text from a node,
+                    // excluding nested time/clock elements (e.g. <span>1s</span>)
+                    function getMoveText(node) {
+                        // Strategy: try to find a dedicated move-text child first
+                        const moveSpan = node.querySelector(
+                            '.node-highlight-content, [data-cy="move-san"], .move-san'
+                        );
+                        if (moveSpan) {
+                            return moveSpan.textContent.trim();
+                        }
+
+                        // Fallback: collect only direct text nodes (skip child elements
+                        // which are often clock/time displays like "1s", "0.3s")
+                        let directText = '';
+                        for (const child of node.childNodes) {
+                            if (child.nodeType === Node.TEXT_NODE) {
+                                directText += child.textContent;
+                            }
+                        }
+                        directText = directText.trim();
+                        if (directText) return directText;
+
+                        // Last resort: full textContent but strip time suffixes
+                        let text = node.textContent.trim();
+                        // Remove embedded time notations like " 1s", " 0.3s", " 12.5s"
+                        text = text.replace(/\\s+\\d+\\.?\\d*s\\b/gi, '').trim();
+                        return text;
+                    }
+
                     // Method A: data-ply attribute elements (most reliable)
                     const plyNodes = document.querySelectorAll('[data-ply]');
                     if (plyNodes.length > 0) {
@@ -297,7 +326,7 @@ class BoardParser:
                                       parseInt(b.getAttribute('data-ply'))
                         );
                         for (const node of sorted) {
-                            const text = node.textContent.trim();
+                            const text = getMoveText(node);
                             if (text && text !== '...' && !/^\\d+\\.$/.test(text)) {
                                 moves.push(text);
                             }
@@ -310,7 +339,7 @@ class BoardParser:
                         '.move-text-component, .move-node, .move-text'
                     );
                     for (const node of moveNodes) {
-                        const text = node.textContent.trim();
+                        const text = getMoveText(node);
                         // Filter out move numbers (e.g., "1.", "2.")
                         if (text && !/^\\d+\\.?$/.test(text) && text !== '...') {
                             moves.push(text);
@@ -328,7 +357,7 @@ class BoardParser:
                             '[class*="white"], [class*="black"], .move-text'
                         );
                         for (const mt of moveTexts) {
-                            const text = mt.textContent.trim();
+                            const text = getMoveText(mt);
                             if (text && !/^\\d+\\.?$/.test(text)) {
                                 moves.push(text);
                             }
@@ -404,6 +433,15 @@ class BoardParser:
             logger.debug("Move list replay failed: %s", e)
             return None
 
+    # Regex to detect time/clock notations: "1s", "0.3s", "12s", "1.5s", etc.
+    _TIME_NOTATION_RE = re.compile(r'^\d+\.?\d*s$', re.IGNORECASE)
+
+    # Regex to validate that a cleaned string looks like a plausible SAN move.
+    # Matches: e4, Nf3, Qxf7+, O-O, O-O-O#, Bxe5#, exd5, R1a3, etc.
+    _PLAUSIBLE_SAN_RE = re.compile(
+        r'^(?:O-O(?:-O)?[+#]?|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)$'
+    )
+
     def _clean_san(self, raw):
         """
         Clean a raw SAN string from chess.com DOM.
@@ -415,6 +453,9 @@ class BoardParser:
         - Ellipsis: "..." (black's move indicator)
         - Whitespace and newlines
         - NAG symbols
+        - Time notations: "1s", "0.3s", "12s" (chess.com clock text)
+        - Result strings: "1-0", "0-1", "½-½", "1/2-1/2", "*"
+        - Pure numbers: "1", "23"
         """
         if not raw:
             return None
@@ -429,6 +470,22 @@ class BoardParser:
         if san in ('...', '…', '..'):
             return None
 
+        # Skip time/clock notations ("1s", "0.3s", "12s", "1.5s")
+        if self._TIME_NOTATION_RE.match(san):
+            return None
+
+        # Skip pure numbers ("1", "23") — sometimes clock seconds without suffix
+        if re.match(r'^\d+$', san):
+            return None
+
+        # Skip game result strings
+        if san in ('1-0', '0-1', '½-½', '1/2-1/2', '*'):
+            return None
+
+        # Remove embedded time notations from combined text
+        # e.g. "e4 1s" → "e4", "Nf3 0.3s" → "Nf3"
+        san = re.sub(r'\s+\d+\.?\d*s\b', '', san, flags=re.IGNORECASE)
+
         # Remove leading move number if embedded ("1.e4" → "e4", "12.Nf3" → "Nf3")
         san = re.sub(r'^\d+\.+\s*', '', san)
 
@@ -440,6 +497,11 @@ class BoardParser:
         san = san.strip()
 
         if not san:
+            return None
+
+        # Final validation: reject anything that doesn't look like a chess move
+        if not self._PLAUSIBLE_SAN_RE.match(san):
+            logger.debug("Rejecting non-SAN text from move list: '%s'", san)
             return None
 
         return san
