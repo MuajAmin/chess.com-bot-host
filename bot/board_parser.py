@@ -544,15 +544,29 @@ class BoardParser:
                                     result.debug.flipped = debugValue(opts.flipped);
                                     result.debug.playingAs = debugValue(opts.playingAs);
                                     result.debug.playerColor = debugValue(opts.playerColor);
+                                    result.debug.isPlayerBlackType = typeof opts.isPlayerBlack;
 
+                                    // Handle boolean, numeric (0/1), and truthy/falsy isPlayerBlack
                                     if (typeof opts.isPlayerBlack === 'boolean') {
                                         result.color = opts.isPlayerBlack ? 'black' : 'white';
                                         result.colorMethod = 'game.getOptions().isPlayerBlack';
+                                    } else if (opts.isPlayerBlack === 1 || opts.isPlayerBlack === '1') {
+                                        result.color = 'black';
+                                        result.colorMethod = 'game.getOptions().isPlayerBlack(numeric)';
+                                    } else if (opts.isPlayerBlack === 0 || opts.isPlayerBlack === '0') {
+                                        result.color = 'white';
+                                        result.colorMethod = 'game.getOptions().isPlayerBlack(numeric)';
                                     }
 
                                     if (typeof opts.isWhiteOnBottom === 'boolean') {
                                         result.orientation = opts.isWhiteOnBottom ? 'white' : 'black';
                                         result.orientationMethod = 'game.getOptions().isWhiteOnBottom';
+                                    } else if (opts.isWhiteOnBottom === 1 || opts.isWhiteOnBottom === '1') {
+                                        result.orientation = 'white';
+                                        result.orientationMethod = 'game.getOptions().isWhiteOnBottom(numeric)';
+                                    } else if (opts.isWhiteOnBottom === 0 || opts.isWhiteOnBottom === '0') {
+                                        result.orientation = 'black';
+                                        result.orientationMethod = 'game.getOptions().isWhiteOnBottom(numeric)';
                                     }
 
                                     if (!result.color) {
@@ -569,6 +583,38 @@ class BoardParser:
                             }
                         } catch (e) {
                             result.debug.getOptionsError = e.message;
+                        }
+
+                        // Fallback: try board-level options (some builds store it directly)
+                        if (!result.color) {
+                            try {
+                                const boardOpts = board.options || board.getOptions?.() || {};
+                                const bIsBlack = boardOpts.isPlayerBlack;
+                                result.debug.boardOptionsIsPlayerBlack = debugValue(bIsBlack);
+                                if (bIsBlack === true || bIsBlack === 1 || bIsBlack === '1') {
+                                    result.color = 'black';
+                                    result.colorMethod = 'board.options.isPlayerBlack';
+                                } else if (bIsBlack === false || bIsBlack === 0 || bIsBlack === '0') {
+                                    result.color = 'white';
+                                    result.colorMethod = 'board.options.isPlayerBlack';
+                                }
+                            } catch (e) {
+                                result.debug.boardOptionsError = e.message;
+                            }
+                        }
+
+                        // Fallback: data-player-color attribute
+                        if (!result.color) {
+                            const dataColor = board.getAttribute('data-player-color')
+                                || board.getAttribute('data-color');
+                            if (dataColor) {
+                                result.debug.dataPlayerColor = dataColor;
+                                const dColor = colorFromValue(dataColor);
+                                if (dColor) {
+                                    result.color = dColor;
+                                    result.colorMethod = 'board[data-player-color]';
+                                }
+                            }
                         }
 
                         try {
@@ -957,67 +1003,124 @@ class BoardParser:
         )
 
     async def detect_our_color(self):
-        """Detect which color the bot is playing without assuming White is bottom."""
+        """Detect which color the bot is playing without assuming White is bottom.
+
+        Uses a retry loop (up to 3 attempts) because Chess.com loads game state
+        asynchronously and the first snapshot read may return incomplete data.
+        """
+        max_attempts = 3
         snapshot = None
         color_method = None
         orientation_method = None
 
         try:
-            await self.wait_for_game_identity_ready()
-            snapshot = await self._read_game_controller_snapshot()
+            identity_ready = await self.wait_for_game_identity_ready()
+            if not identity_ready:
+                logger.warning(
+                    "wait_for_game_identity_ready timed out — will retry color detection anyway"
+                )
 
-            if snapshot:
-                if snapshot.get("botUsername"):
-                    self._detected_username = snapshot["botUsername"]
+            for attempt in range(1, max_attempts + 1):
+                snapshot = await self._read_game_controller_snapshot()
 
-                orientation = snapshot.get("orientation")
-                orientation_method = snapshot.get("orientationMethod")
-                bot_side = snapshot.get("botSide")
-                bot_color = snapshot.get("color")
-                color_method = snapshot.get("colorMethod")
+                if snapshot:
+                    if snapshot.get("botUsername"):
+                        self._detected_username = snapshot["botUsername"]
 
-                if bot_color not in ("white", "black"):
-                    if orientation in ("white", "black") and bot_side in ("top", "bottom"):
-                        bot_color = (
-                            orientation
-                            if bot_side == "bottom"
-                            else ("black" if orientation == "white" else "white")
-                        )
-                        color_method = "board-orientation+username-position"
+                    orientation = snapshot.get("orientation")
+                    orientation_method = snapshot.get("orientationMethod")
+                    bot_side = snapshot.get("botSide")
+                    bot_color = snapshot.get("color")
+                    color_method = snapshot.get("colorMethod")
 
-                if orientation not in ("white", "black"):
-                    if bot_color in ("white", "black") and bot_side in ("top", "bottom"):
-                        orientation = (
-                            bot_color
-                            if bot_side == "bottom"
-                            else ("black" if bot_color == "white" else "white")
-                        )
-                        orientation_method = "bot-color+username-position"
+                    if bot_color not in ("white", "black"):
+                        if orientation in ("white", "black") and bot_side in ("top", "bottom"):
+                            bot_color = (
+                                orientation
+                                if bot_side == "bottom"
+                                else ("black" if orientation == "white" else "white")
+                            )
+                            color_method = "board-orientation+username-position"
 
-                if bot_color in ("white", "black"):
-                    # bot_color is intentionally kept as a string for debug/use by callers.
-                    self._set_colors(bot_color=bot_color, board_orientation=orientation, bot_side=bot_side)
+                    if orientation not in ("white", "black"):
+                        if bot_color in ("white", "black") and bot_side in ("top", "bottom"):
+                            orientation = (
+                                bot_color
+                                if bot_side == "bottom"
+                                else ("black" if bot_color == "white" else "white")
+                            )
+                            orientation_method = "bot-color+username-position"
 
-                    if self._board_orientation is None:
-                        self._set_colors(board_orientation=bot_color)
-                        orientation_method = orientation_method or "bot-color-fallback"
+                    if bot_color in ("white", "black"):
+                        self._set_colors(bot_color=bot_color, board_orientation=orientation, bot_side=bot_side)
 
-                    self._log_color_detection(snapshot, color_method, orientation_method)
-                    return self._our_color
+                        if self._board_orientation is None:
+                            self._set_colors(board_orientation=bot_color)
+                            orientation_method = orientation_method or "bot-color-fallback"
 
+                        self._log_color_detection(snapshot, color_method, orientation_method)
+                        logger.info("Color detected on attempt %d/%d", attempt, max_attempts)
+                        return self._our_color
+
+                # Not detected yet — log and retry
+                if attempt < max_attempts:
+                    debug = snapshot.get("debug", {}) if snapshot else {}
+                    logger.info(
+                        "Color detection attempt %d/%d: no color found. "
+                        "isPlayerBlack=%s (type=%s), orientation=%s, botSide=%s. Retrying in 1s...",
+                        attempt, max_attempts,
+                        debug.get("isPlayerBlack"),
+                        debug.get("isPlayerBlackType", "n/a"),
+                        snapshot.get("orientation") if snapshot else None,
+                        snapshot.get("botSide") if snapshot else None,
+                    )
+                    await asyncio.sleep(1.0)
+
+            # All attempts exhausted
+            self._log_failed_color_detection(snapshot)
             logger.warning(
-                "Color detection: all strategies failed. Defaulting to WHITE. Snapshot: %s",
-                snapshot,
+                "Color detection: all %d attempts failed. Defaulting to WHITE.",
+                max_attempts,
             )
             self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
             self._log_color_detection(snapshot, "default-white", "default-white")
             return self._our_color
 
         except Exception as e:
-            logger.warning("Color detection failed, defaulting to WHITE: %s", e)
+            logger.warning("Color detection failed, defaulting to WHITE: %s", e, exc_info=True)
             self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
             self._log_color_detection(snapshot, "exception-default-white", "exception-default-white")
             return self._our_color
+
+    def _log_failed_color_detection(self, snapshot):
+        """Log comprehensive diagnostic info when color detection fails."""
+        if not snapshot:
+            logger.warning("Color detection diagnostic: snapshot is None/empty")
+            return
+
+        debug = snapshot.get("debug", {})
+        logger.warning("=== COLOR DETECTION FAILURE DIAGNOSTICS ===")
+        logger.warning("  Selector: %s | Tag: %s", snapshot.get("selector"), snapshot.get("tagName"))
+        logger.warning("  color=%s (method=%s)", snapshot.get("color"), snapshot.get("colorMethod"))
+        logger.warning("  orientation=%s (method=%s)", snapshot.get("orientation"), snapshot.get("orientationMethod"))
+        logger.warning("  botSide=%s | botUsername=%s", snapshot.get("botSide"), snapshot.get("botUsername"))
+        logger.warning("  topPlayer=%s", snapshot.get("topPlayer"))
+        logger.warning("  bottomPlayer=%s", snapshot.get("bottomPlayer"))
+        logger.warning("  isPlayerBlack=%s (type=%s)", debug.get("isPlayerBlack"), debug.get("isPlayerBlackType"))
+        logger.warning("  isWhiteOnBottom=%s", debug.get("isWhiteOnBottom"))
+        logger.warning("  playingAs=%s | playerColor=%s", debug.get("playingAs"), debug.get("playerColor"))
+        logger.warning("  getPlayingAs=%s", debug.get("getPlayingAs"))
+        logger.warning("  boardOptionsIsPlayerBlack=%s", debug.get("boardOptionsIsPlayerBlack"))
+        logger.warning("  dataPlayerColor=%s", debug.get("dataPlayerColor"))
+        logger.warning("  candidates=%s", debug.get("candidates"))
+        logger.warning("  playerCandidates=%s", debug.get("playerCandidates"))
+        logger.warning("  playerIdentityMatches=%s", debug.get("playerIdentityMatches"))
+        logger.warning("  loggedInUsernameCandidates=%s", debug.get("loggedInUsernameCandidates"))
+        logger.warning("  botUsernameSource=%s", debug.get("botUsernameSource"))
+        logger.warning("  Errors: opts=%s, playingAs=%s, boardOpts=%s",
+                       debug.get("getOptionsError"), debug.get("getPlayingAsError"),
+                       debug.get("boardOptionsError"))
+        logger.warning("=== END DIAGNOSTICS ===")
 
     async def get_board_fen(self):
         """
@@ -1072,24 +1175,32 @@ class BoardParser:
 
     async def _maybe_starting_board(self):
         """
-        Use the normal starting position when a new white game has no moves yet.
+        Use the normal starting position when a new game has no moves yet.
 
-        Chess.com often renders an empty move list before White's first move.
+        Chess.com often renders an empty move list before the first move.
         Move replay is still the primary strategy after the first ply appears.
+
+        Works for both White (waiting for our first move) and Black (waiting
+        for opponent's first move).
         """
         if self._last_clean_moves or self._move_count > 0:
             return None
-        if self._our_color != chess.WHITE:
+        if self._our_color is None:
             return None
         if not await self._has_visible_game_board():
             return None
 
         turn = await self._detect_turn()
         if turn != chess.WHITE:
+            # If turn isn't White, the game has already started — moves should be visible
             return None
 
         board = chess.Board()
-        logger.info("No move history yet; using standard starting position for White's first move.")
+        color_name = "White" if self._our_color == chess.WHITE else "Black"
+        logger.info(
+            "No move history yet; using standard starting position (playing as %s, White to move).",
+            color_name,
+        )
         return board
 
     async def _has_visible_game_board(self):
