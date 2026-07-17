@@ -488,7 +488,23 @@ class BoardParser:
                 if san
             )
             if not clean_moves:
+                # Log what was extracted but rejected — helps diagnose DOM issues
+                if raw_moves:
+                    logger.warning(
+                        "Move list replay: %d raw moves extracted but ALL rejected "
+                        "by _clean_san. Raw: %s",
+                        len(raw_moves), raw_moves[:10],
+                    )
                 return None
+
+            # Log when some moves got filtered (potential parsing issue)
+            if len(clean_moves) != len(raw_moves):
+                logger.debug(
+                    "Move list replay: %d/%d raw moves survived cleaning. "
+                    "Raw: %s → Clean: %s",
+                    len(clean_moves), len(raw_moves),
+                    raw_moves[:10], clean_moves[:10],
+                )
 
             if self._last_board is not None and clean_moves == self._last_clean_moves:
                 return self._last_board

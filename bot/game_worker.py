@@ -154,6 +154,8 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
     repeat_move_count = 0      # how many times we've tried the same move
     MAX_REPEAT_MOVES = 3       # abort after this many identical attempts
     last_not_our_turn_fen = None
+    _wait_logged = False       # flag to log "waiting" only once per opponent turn
+    _wait_count = 0            # how many 0.5s cycles we've waited
 
     while True:
         try:
@@ -167,8 +169,20 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
 
             # Wait for our turn
             if not await board_parser.is_our_turn():
+                _wait_count += 1
+                if not _wait_logged:
+                    logger.info("Waiting for opponent's move...")
+                    _wait_logged = True
+                # Every 30s of waiting, log a heartbeat so user knows bot is alive
+                if _wait_count % 60 == 0:
+                    logger.info(
+                        "Still waiting for opponent... (%ds elapsed)",
+                        _wait_count * 0.5,
+                    )
                 await asyncio.sleep(0.5)
                 continue
+            _wait_logged = False
+            _wait_count = 0
 
             # Update clock data for timing model
             clock_data = await board_parser.get_remaining_time()
