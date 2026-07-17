@@ -196,6 +196,123 @@ class MoveMaker:
             logger.error("Failed to make move %s%s: %s", from_name, to_name, e)
             return False
 
+    async def make_controller_move(self, move):
+        """
+        Execute a move through Chess.com's board controller.
+
+        This is a fallback for cases where mouse clicks complete at the browser
+        protocol level but Chess.com does not accept the move. It follows the
+        same shape as Mint.js: find a legal move by from/to, mark it
+        userGenerated, then call controller.move(moveData).
+        """
+        from_name = chess.square_name(move.from_square)
+        to_name = chess.square_name(move.to_square)
+        promotion = None
+        if move.promotion:
+            promotion = {
+                chess.QUEEN: "q",
+                chess.ROOK: "r",
+                chess.BISHOP: "b",
+                chess.KNIGHT: "n",
+            }.get(move.promotion)
+
+        try:
+            result = await self.page.evaluate(
+                """
+                async ({ from, to, promotion }) => {
+                    const result = {
+                        ok: false,
+                        reason: null,
+                        selector: null,
+                        legalMoveCount: 0
+                    };
+
+                    const selectors = ['wc-chess-board', 'chess-board', '.board', '#board-single'];
+                    const candidates = [];
+                    const seen = new Set();
+
+                    for (const selector of selectors) {
+                        for (const el of document.querySelectorAll(selector)) {
+                            if (!el || seen.has(el)) continue;
+                            seen.add(el);
+                            const rect = el.getBoundingClientRect();
+                            candidates.push({
+                                el,
+                                selector,
+                                visible: rect.width >= 100 && rect.height >= 100,
+                                area: rect.width * rect.height,
+                                hasGame: !!el.game
+                            });
+                        }
+                    }
+
+                    candidates.sort((a, b) => {
+                        const aScore = (a.visible ? 4 : 0) + (a.hasGame ? 2 : 0);
+                        const bScore = (b.visible ? 4 : 0) + (b.hasGame ? 2 : 0);
+                        if (aScore !== bScore) return bScore - aScore;
+                        return b.area - a.area;
+                    });
+
+                    const picked = candidates.find((c) => c.hasGame && c.visible) ||
+                                   candidates.find((c) => c.hasGame);
+                    if (!picked) {
+                        result.reason = 'no board controller';
+                        return result;
+                    }
+
+                    result.selector = picked.selector;
+                    const controller = picked.el.game;
+                    if (!controller || !controller.getLegalMoves || !controller.move) {
+                        result.reason = 'controller move api unavailable';
+                        return result;
+                    }
+
+                    const legalMoves = controller.getLegalMoves() || [];
+                    result.legalMoveCount = legalMoves.length;
+                    const moveData = legalMoves.find((candidate) => (
+                        candidate &&
+                        candidate.from === from &&
+                        candidate.to === to &&
+                        (!promotion || !candidate.promotion || candidate.promotion === promotion)
+                    ));
+
+                    if (!moveData) {
+                        result.reason = `move ${from}${to} not in legal moves`;
+                        result.legalMoves = legalMoves.slice(0, 12).map((candidate) => ({
+                            from: candidate && candidate.from,
+                            to: candidate && candidate.to,
+                            promotion: candidate && candidate.promotion
+                        }));
+                        return result;
+                    }
+
+                    moveData.userGenerated = true;
+                    if (promotion) moveData.promotion = promotion;
+                    await Promise.resolve(controller.move(moveData));
+                    result.ok = true;
+                    return result;
+                }
+                """,
+                {"from": from_name, "to": to_name, "promotion": promotion},
+            )
+
+            if result and result.get("ok"):
+                logger.info(
+                    "Controller move executed: %s%s (selector=%s, legal=%s)",
+                    from_name,
+                    to_name,
+                    result.get("selector"),
+                    result.get("legalMoveCount"),
+                )
+                return True
+
+            logger.warning("Controller move failed for %s%s: %s", from_name, to_name, result)
+            return False
+
+        except Exception as e:
+            logger.warning("Controller move exception for %s%s: %s", from_name, to_name, e)
+            return False
+
     async def _move_mouse_bezier(self, start, end):
         """
         Move mouse from start to end along a Bézier curve path.

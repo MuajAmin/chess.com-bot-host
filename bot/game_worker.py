@@ -289,12 +289,27 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
                 await asyncio.sleep(1)
                 continue
 
-            if not await board_parser.wait_for_position_change(board.fen()):
+            move_registered = await board_parser.wait_for_position_change(board.fen())
+            if not move_registered:
                 logger.warning(
                     "Clicked %s but board state did not advance within timeout; "
-                    "will re-check before retrying.",
+                    "trying controller fallback.",
                     move.uci(),
                 )
+                if await move_maker.make_controller_move(move):
+                    move_registered = await board_parser.wait_for_position_change(
+                        board.fen(),
+                        timeout_sec=3.0,
+                    )
+
+            if not move_registered:
+                logger.warning(
+                    "Move %s still did not register after fallback; re-checking position.",
+                    move.uci(),
+                )
+                consecutive_errors += 1
+                await asyncio.sleep(0.5)
+                continue
 
             logger.info(
                 "Move played: %s (move #%d)",
