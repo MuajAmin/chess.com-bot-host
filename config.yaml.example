@@ -10,7 +10,6 @@ account:
 
 challenge:
   mode: "whitelist"          # "whitelist" = only allowed users, "open" = accept all
-  play_as: "any"             # "any", "white", or "black"; aborts if assigned wrong color
   allowed_users:
     - "friend1"
     - "friend2"

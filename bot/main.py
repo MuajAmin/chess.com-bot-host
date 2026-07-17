@@ -97,20 +97,6 @@ async def play_game_inprocess(session, config, board_parser, engine, humanizer, 
     logger.info("GAME STARTED — Playing as %s (in-process fallback)", color_name)
     logger.info("=" * 50)
 
-    actual_color = "white" if board_parser.is_white else "black"
-    required_color = config.challenge_play_as
-    if required_color != "any" and actual_color != required_color:
-        final_result = f"wrong_color_{actual_color}"
-        logger.warning(
-            "Chess.com assigned %s, but challenge.play_as is %s. "
-            "Aborting without making a move.",
-            actual_color.upper(),
-            required_color.upper(),
-        )
-        await game_tracker.abort_current_game()
-        duration = game_tracker.end_game(final_result)
-        return final_result, duration
-
     # Detect time control and feed to timing model
     tc_data = await board_parser.detect_time_control()
     if tc_data:

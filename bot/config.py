@@ -21,7 +21,6 @@ DEFAULTS = {
     "challenge": {
         "mode": "whitelist",
         "allowed_users": [],
-        "play_as": "any",  # any | white | black
     },
     "engine": {
         "type": "auto",  # maia | lc0 | auto (auto-detect from weights filename)
@@ -177,11 +176,6 @@ class Config:
             )
         if self.challenge_mode not in ("whitelist", "open"):
             errors.append(f"challenge.mode must be 'whitelist' or 'open', got: {self.challenge_mode}")
-        if self.challenge_play_as not in ("any", "white", "black"):
-            errors.append(
-                f"challenge.play_as must be 'any', 'white', or 'black', "
-                f"got: {self.challenge_play_as}"
-            )
         if self.timing_delay_min > self.timing_delay_max:
             errors.append("timing.delay_min must be <= timing.delay_max")
         if not 0 <= self.timing_premove_chance <= 1:
@@ -233,10 +227,6 @@ class Config:
     @property
     def allowed_users(self):
         return self._data["challenge"]["allowed_users"]
-
-    @property
-    def challenge_play_as(self):
-        return str(self._data["challenge"].get("play_as", "any")).strip().lower()
 
     # --- Engine ---
     @property
