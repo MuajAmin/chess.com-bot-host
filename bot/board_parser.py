@@ -831,7 +831,14 @@ class BoardParser:
     async def _detect_turn(self):
         """Detect whose turn it is using multiple methods."""
         try:
-            # Method 1: Check active clock via JS (most reliable)
+            # Method 1: Reuse SAN replay when possible. This is more reliable
+            # than clock CSS, because chess.com can mark the wrong clock-like
+            # element active while animations or nested timers update.
+            board = await self._parse_from_move_replay()
+            if board is not None:
+                return board.turn
+
+            # Method 2: Check active clock via JS.
             turn_data = await self.page.evaluate("""
                 () => {
                     // Check which clock has the 'active' or 'running' indicator
@@ -873,13 +880,6 @@ class BoardParser:
                     return self._our_color
                 elif turn_data.get("topActive"):
                     return chess.BLACK if self._our_color == chess.WHITE else chess.WHITE
-
-            # Method 2: Reuse SAN replay when possible. This is more reliable
-            # than counting raw move-list nodes, because chess.com may render
-            # placeholders or nested move elements.
-            board = await self._parse_from_move_replay()
-            if board is not None:
-                return board.turn
 
             # Method 3: Count only text that looks like an actual move.
             raw_moves = await self.page.evaluate("""
