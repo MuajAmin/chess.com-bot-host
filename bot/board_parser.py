@@ -19,6 +19,7 @@ import asyncio
 import re
 import time
 import chess
+from bot.color_auto_detection import detect_auto_color
 
 logger = logging.getLogger(__name__)
 
@@ -1077,7 +1078,6 @@ class BoardParser:
         visible_orientation_methods = {
             "piece-position-crosscheck",
             "data-square-position",
-            "coordinates",
             "king-screen-position",
             "board.flipped",
             "board.class-flipped",
@@ -1090,6 +1090,53 @@ class BoardParser:
             if not identity_ready:
                 logger.warning(
                     "wait_for_game_identity_ready timed out — will retry color detection anyway"
+                )
+
+            auto_snapshot = await detect_auto_color(self.page, self.username)
+            if auto_snapshot:
+                snapshot = auto_snapshot
+                if snapshot.get("botUsername"):
+                    self._detected_username = snapshot["botUsername"]
+
+                auto_color = snapshot.get("color")
+                auto_orientation = snapshot.get("orientation")
+                auto_side = snapshot.get("botSide")
+                color_method = snapshot.get("colorMethod")
+                orientation_method = snapshot.get("orientationMethod")
+
+                if auto_color in ("white", "black"):
+                    self._set_colors(
+                        bot_color=auto_color,
+                        board_orientation=auto_orientation,
+                        bot_side=auto_side,
+                    )
+                    if self._board_orientation is None:
+                        self._set_colors(board_orientation=auto_color)
+                        orientation_method = orientation_method or "bot-color-fallback"
+
+                    self._log_color_detection(snapshot, color_method, orientation_method)
+                    logger.info(
+                        "Auto color detected on attempt %s: activeClockSide=%s, turn=%s (%s)",
+                        snapshot.get("attempt", "?"),
+                        snapshot.get("activeClockSide"),
+                        snapshot.get("turn"),
+                        snapshot.get("turnMethod"),
+                    )
+                    return self._our_color
+
+                debug = snapshot.get("debug", {})
+                logger.warning(
+                    "Auto color detector did not find a safe color. "
+                    "botSide=%s, activeClockSide=%s, turn=%s (%s), "
+                    "orientation=%s (%s/%s), resolution=%s",
+                    snapshot.get("botSide"),
+                    snapshot.get("activeClockSide"),
+                    snapshot.get("turn"),
+                    snapshot.get("turnMethod"),
+                    snapshot.get("orientation"),
+                    snapshot.get("orientationMethod"),
+                    snapshot.get("orientationConfidence"),
+                    debug.get("resolution"),
                 )
 
             for attempt in range(1, max_attempts + 1):
@@ -1121,6 +1168,28 @@ class BoardParser:
                             orientation = verified_orientation
                             orientation_method = "piece-position-crosscheck"
 
+                    coordinates_only_orientation = (
+                        orientation_method == "coordinates" and not verified_orientation
+                    )
+                    if (
+                        coordinates_only_orientation and
+                        color_method in (
+                            "player-panel-username",
+                            "board-orientation+username-position",
+                        )
+                    ):
+                        logger.warning(
+                            "Rejecting coordinates-only color decision: color=%s (%s), "
+                            "orientation=%s (%s), botSide=%s",
+                            bot_color,
+                            color_method,
+                            orientation,
+                            orientation_method,
+                            bot_side,
+                        )
+                        bot_color = None
+                        color_method = None
+
                     if orientation not in ("white", "black"):
                         if bot_color in ("white", "black") and bot_side in ("top", "bottom"):
                             orientation = (
@@ -1132,11 +1201,14 @@ class BoardParser:
 
                     if bot_color not in ("white", "black"):
                         panel_color = self._color_from_orientation_and_side(orientation, bot_side)
-                        if panel_color:
+                        if panel_color and not coordinates_only_orientation:
                             bot_color = panel_color
                             color_method = "board-orientation+username-position"
 
-                    panel_color = self._color_from_orientation_and_side(orientation, bot_side)
+                    panel_color = (
+                        None if coordinates_only_orientation
+                        else self._color_from_orientation_and_side(orientation, bot_side)
+                    )
                     if (
                         panel_color in ("white", "black") and
                         bot_color in ("white", "black") and
@@ -1245,18 +1317,19 @@ class BoardParser:
 
             # All attempts exhausted
             self._log_failed_color_detection(snapshot)
-            logger.warning(
-                "Color detection: all %d attempts failed. Defaulting to WHITE.",
+            logger.error(
+                "Color detection: all %d attempts failed. Leaving bot color unknown "
+                "instead of defaulting to WHITE.",
                 max_attempts,
             )
-            self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
-            self._log_color_detection(snapshot, "default-white", "default-white")
             return self._our_color
 
         except Exception as e:
-            logger.warning("Color detection failed, defaulting to WHITE: %s", e, exc_info=True)
-            self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
-            self._log_color_detection(snapshot, "exception-default-white", "exception-default-white")
+            logger.warning(
+                "Color detection failed. Leaving bot color unknown instead of defaulting to WHITE: %s",
+                e,
+                exc_info=True,
+            )
             return self._our_color
 
     async def _verify_orientation_from_pieces(self):
