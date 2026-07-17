@@ -192,6 +192,112 @@ class GameTracker:
             logger.warning("Game start detection error: %s", e)
             return False
 
+    async def abort_current_game(self):
+        """Abort the current game if Chess.com exposes an abort control."""
+        try:
+            clicked = await self.page.evaluate("""
+                () => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
+                    const attrsOf = (el) => [
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-cy') || '',
+                        el.getAttribute('class') || '',
+                        textOf(el),
+                    ].join(' ').toLowerCase();
+                    const click = (el) => {
+                        el.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window,
+                        }));
+                    };
+
+                    const candidates = Array.from(document.querySelectorAll(
+                        'button, [role="button"], a, [class*="abort"]'
+                    )).filter(isVisible);
+
+                    for (const el of candidates) {
+                        const attrs = attrsOf(el);
+                        if (attrs.includes('abort') && !attrs.includes('resign')) {
+                            click(el);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+
+            if not clicked:
+                logger.warning("Wrong-color game detected, but no abort control was visible.")
+                return False
+
+            await self.page.wait_for_timeout(400)
+            await self.page.evaluate("""
+                () => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden';
+                    };
+                    const textOf = (el) => (el?.innerText || el?.textContent || '').trim();
+                    const attrsOf = (el) => [
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-cy') || '',
+                        el.getAttribute('class') || '',
+                        textOf(el),
+                    ].join(' ').toLowerCase();
+                    const click = (el) => {
+                        el.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window,
+                        }));
+                    };
+
+                    const candidates = Array.from(document.querySelectorAll(
+                        '.modal button, .modal [role="button"], ' +
+                        '[class*="modal"] button, [class*="modal"] [role="button"], ' +
+                        'button, [role="button"]'
+                    )).filter(isVisible);
+
+                    for (const el of candidates) {
+                        const attrs = attrsOf(el);
+                        if (
+                            attrs.includes('abort') ||
+                            attrs.includes('confirm') ||
+                            attrs.includes('yes') ||
+                            attrs.includes('ok')
+                        ) {
+                            click(el);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            await self.page.wait_for_timeout(500)
+            logger.info("Abort requested for wrong-color game.")
+            return True
+
+        except Exception as e:
+            logger.warning("Could not abort wrong-color game: %s", e)
+            return False
+
     async def dismiss_end_modal(self):
         """Close the game-over modal if present."""
         try:

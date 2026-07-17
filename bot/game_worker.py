@@ -142,6 +142,19 @@ async def play_game(page, config, board_parser, engine, humanizer, move_maker, g
     logger.info("GAME STARTED — Playing as %s (subprocess worker)", color_name)
     logger.info("=" * 50)
 
+    actual_color = "white" if board_parser.is_white else "black"
+    required_color = config.challenge_play_as
+    if required_color != "any" and actual_color != required_color:
+        logger.warning(
+            "Chess.com assigned %s, but challenge.play_as is %s. "
+            "Aborting without making a move.",
+            actual_color.upper(),
+            required_color.upper(),
+        )
+        await game_tracker.abort_current_game()
+        game_tracker.end_game(f"wrong_color_{actual_color}")
+        return
+
     # Detect time control and feed to timing model
     tc_data = await board_parser.detect_time_control()
     if tc_data:

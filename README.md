@@ -51,6 +51,7 @@ account:
 
 challenge:
   mode: "whitelist"            # whitelist | open
+  play_as: "any"               # any | white | black
   allowed_users:
     - "friend1"
     - "friend2"
@@ -98,6 +99,7 @@ server:
 | Section | Parameter | Default | Description |
 | :--- | :--- | :--- | :--- |
 | **account** | `login_mode` | `auto` | `cookie_only` bypasses credential entry. `credentials` skips cookie checks. `auto` tries cookies first, then credentials. |
+| **challenge** | `play_as` | `any` | Optional assigned-color guard. Set `black` when the challenger should play White and the bot should only answer as Black. |
 | **engine** | `type` | `auto` | `maia` forces policy-only `nodes=1`; `lc0` forces time-based search; `auto` checks the weights filename for "maia". |
 | **timing** | `enabled` | `true` | Enables human-like delays while preserving the exact engine move. |
 | **timing** | `delay_min` / `delay_max` | `0.3` / `1.5` | Normal delay range used by the timing model. Fast premove-style replies may be shorter when the move is forced or obvious. |
