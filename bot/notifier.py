@@ -12,6 +12,9 @@ Silently disabled when webhook_url is not configured.
 """
 
 import logging
+import asyncio
+import re
+import urllib.parse as urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +36,48 @@ class Notifier:
     """
 
     def __init__(self, config):
-        self._webhook_url = config.webhook_url
+        raw_url = config.webhook_url.strip() if config.webhook_url else ""
+        self._webhook_url = raw_url
+
+        # Support shorthand scheme formats:
+        # - telegram://TOKEN/CHAT_ID
+        # - discord://ID/TOKEN
+        if raw_url.startswith("telegram://"):
+            token_chat = raw_url[11:]
+            if "/" in token_chat:
+                token, chat_id = token_chat.split("/", 1)
+                self._webhook_url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}"
+            else:
+                logger.warning("Notifier: Invalid telegram:// format. Expected telegram://TOKEN/CHAT_ID")
+        elif raw_url.startswith("discord://"):
+            token_part = raw_url[10:]
+            self._webhook_url = f"https://discord.com/api/webhooks/{token_part}"
+
+        # Clean/normalize Telegram URLs:
+        # e.g., api.telegram.org/botTOKEN?chat_id=CHAT_ID -> https://api.telegram.org/botTOKEN/sendMessage?chat_id=CHAT_ID
+        if "api.telegram.org" in self._webhook_url:
+            if not self._webhook_url.startswith(("http://", "https://")):
+                self._webhook_url = "https://" + self._webhook_url
+            
+            try:
+                parsed = urlparse.urlparse(self._webhook_url)
+                path = parsed.path
+                if path.startswith("/bot"):
+                    parts = [p for p in path.split('/') if p]
+                    if len(parts) >= 1:
+                        token_part = parts[0]
+                        new_path = f"/{token_part}/sendMessage"
+                        self._webhook_url = urlparse.urlunparse((
+                            parsed.scheme,
+                            parsed.netloc,
+                            new_path,
+                            parsed.params,
+                            parsed.query,
+                            parsed.fragment
+                        ))
+            except Exception as e:
+                logger.debug("Failed to normalize telegram URL path: %s", e)
+
         self._enabled = bool(self._webhook_url) and _HTTPX_AVAILABLE
         self._username = config.username
         self._is_telegram = "api.telegram.org" in self._webhook_url if self._webhook_url else False
@@ -42,16 +86,39 @@ class Notifier:
 
         if self._enabled:
             logger.info(
-                "Notifier enabled (%s)",
+                "Notifier enabled (%s): %s",
                 "Telegram" if self._is_telegram else
                 "Discord" if self._is_discord else "Generic webhook",
+                self._webhook_url[:45] + "..." if len(self._webhook_url) > 45 else self._webhook_url
             )
+            if self._is_telegram and "chat_id=" not in self._webhook_url:
+                logger.warning(
+                    "Notifier: Telegram webhook URL configured, but is missing '?chat_id=YOUR_CHAT_ID'. "
+                    "Notifications to Telegram will fail."
+                )
         else:
             if self._webhook_url and not _HTTPX_AVAILABLE:
                 logger.warning(
                     "Notifier: webhook_url configured but httpx not installed. "
                     "Install with: pip install httpx"
                 )
+
+    def _format_message(self, message):
+        """Converts HTML-formatted message to the correct platform markup."""
+        if self._is_telegram:
+            # Telegram natively supports HTML
+            return message
+
+        if self._is_discord:
+            # Convert HTML tags to Discord markdown
+            msg = re.sub(r'</?b>', '**', message)
+            msg = re.sub(r'</?i>', '*', msg)
+            msg = re.sub(r'</?u>', '__', msg)
+            msg = re.sub(r'</?code>', '`', msg)
+            return msg
+
+        # Generic webhook or fallback: strip all HTML tags
+        return re.sub(r'<[^>]*>', '', message)
 
     async def notify(self, message):
         """
@@ -63,47 +130,53 @@ class Notifier:
         if not self._enabled:
             return
 
-        try:
-            if self._is_telegram:
-                # Telegram Bot API: extract chat_id from URL or use as-is
-                # Expected URL: https://api.telegram.org/bot<TOKEN>/sendMessage
-                payload = {
-                    "text": message,
-                    "parse_mode": "HTML",
-                }
-                # If URL already has chat_id param, use it
-                if "chat_id=" not in self._webhook_url:
-                    logger.warning("Telegram webhook: chat_id not in URL. Include ?chat_id=YOUR_CHAT_ID")
-                    return
-                response = await self._client.post(self._webhook_url, json=payload)
+        formatted_msg = self._format_message(message)
+        max_attempts = 2
 
-            elif self._is_discord:
-                # Discord webhook: POST with content field
-                payload = {"content": message}
-                response = await self._client.post(self._webhook_url, json=payload)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if self._is_telegram:
+                    payload = {
+                        "text": formatted_msg,
+                        "parse_mode": "HTML",
+                    }
+                    if "chat_id=" not in self._webhook_url:
+                        logger.warning("Telegram webhook: chat_id not in URL. Include ?chat_id=YOUR_CHAT_ID")
+                        return
+                    response = await self._client.post(self._webhook_url, json=payload)
 
-            else:
-                # Generic webhook: POST JSON with message field
-                payload = {
-                    "message": message,
-                    "bot": self._username,
-                    "source": "chess.com-bot",
-                }
-                response = await self._client.post(self._webhook_url, json=payload)
+                elif self._is_discord:
+                    payload = {"content": formatted_msg}
+                    response = await self._client.post(self._webhook_url, json=payload)
 
-            if response.status_code >= 400:
-                logger.warning(
-                    "Webhook returned %d: %s",
-                    response.status_code, response.text[:200],
-                )
-            else:
-                logger.debug("Webhook notification sent (%d)", response.status_code)
+                else:
+                    payload = {
+                        "message": formatted_msg,
+                        "bot": self._username,
+                        "source": "chess.com-bot",
+                    }
+                    response = await self._client.post(self._webhook_url, json=payload)
 
-        except httpx.TimeoutException:
-            logger.warning("Webhook notification timed out")
-        except Exception as e:
-            # Never let notification failure crash the bot
-            logger.warning("Webhook notification failed: %s", e)
+                if response.status_code >= 400:
+                    logger.warning(
+                        "Webhook returned %d (Attempt %d/%d): %s",
+                        response.status_code, attempt, max_attempts, response.text[:200],
+                    )
+                    if response.status_code >= 500 and attempt < max_attempts:
+                        await asyncio.sleep(1)
+                        continue
+                else:
+                    logger.debug("Webhook notification sent (%d)", response.status_code)
+                    break
+
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                logger.warning("Webhook connection error (Attempt %d/%d): %s", attempt, max_attempts, e)
+                if attempt < max_attempts:
+                    await asyncio.sleep(1)
+                    continue
+            except Exception as e:
+                logger.warning("Webhook notification failed: %s", e)
+                break
 
     async def close(self):
         """Close the reusable HTTP client."""
