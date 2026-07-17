@@ -285,22 +285,168 @@ class HumanTiming:
         max_delay = max(min_delay, float(self.config.timing_delay_max))
         return min_delay, max_delay
 
-    def _calculate_premove_delay(self):
+    def _config_float(self, attr_name, fallback):
+        try:
+            return float(getattr(self.config, attr_name))
+        except (AttributeError, TypeError, ValueError):
+            return fallback
+
+    def _opening_delay_max(self, min_delay, max_delay):
+        fallback = min(max_delay, max(min_delay + 0.25, 0.8))
+        configured = self._config_float("timing_opening_delay_max", fallback)
+        return _clamp(configured, min_delay, max_delay)
+
+    def _forced_delay_max(self):
+        configured = self._config_float("timing_forced_delay_max", 0.22)
+        return _clamp(configured, 0.06, 1.0)
+
+    def _critical_delay_max(self, max_delay):
+        fallback = max(max_delay, min(6.0, max_delay * 3.0))
+        configured = self._config_float("timing_critical_delay_max", fallback)
+        return max(max_delay, configured)
+
+    def _criticality(self, metrics):
+        legal_moves = metrics["legal_move_count"]
+        score = 0.0
+
+        if metrics["in_check"]:
+            score += 0.34 if legal_moves > 3 else 0.14
+
+        if legal_moves > 40:
+            score += 0.22
+        elif legal_moves > 30:
+            score += 0.14
+        elif legal_moves > 22:
+            score += 0.08
+
+        if metrics["capture_moves"] >= 8:
+            score += 0.18
+        elif metrics["capture_moves"] >= 4:
+            score += 0.10
+
+        if metrics["check_moves"] >= 4:
+            score += 0.16
+        elif metrics["check_moves"] >= 2:
+            score += 0.09
+
+        if metrics["promotion_moves"]:
+            score += 0.24
+
+        hanging_material = metrics["hanging_material"]
+        if hanging_material >= 9:
+            score += 0.28
+        elif hanging_material >= 5:
+            score += 0.18
+        elif metrics["hanging"] >= 2:
+            score += 0.10
+
+        if metrics["high_value_hanging"]:
+            score += 0.12
+
+        if metrics["max_capture_value"] >= 9:
+            score += 0.14
+        elif metrics["max_capture_value"] >= 5:
+            score += 0.08
+
+        if metrics["king_pressure"] >= 7:
+            score += 0.22
+        elif metrics["king_pressure"] >= 4:
+            score += 0.12
+
+        if metrics["simple_recapture"]:
+            score -= 0.18
+
+        if legal_moves == 1:
+            score -= 0.40
+        elif legal_moves <= 3:
+            score -= 0.15
+
+        return _clamp(score, 0.0, 1.0)
+
+    def _is_opening_fast(self, metrics, criticality=None):
+        if criticality is None:
+            criticality = self._criticality(metrics)
+
+        return (
+            metrics["fullmove_number"] <= 8
+            and metrics["piece_count"] >= 24
+            and not metrics["in_check"]
+            and metrics["promotion_moves"] == 0
+            and criticality < 0.38
+        )
+
+    def _forced_score(self, metrics, criticality=None):
+        if criticality is None:
+            criticality = self._criticality(metrics)
+
+        legal_moves = metrics["legal_move_count"]
+        if legal_moves == 1:
+            return 1.0
+        if metrics["in_check"] and legal_moves <= 2:
+            return 0.65
+        if metrics["simple_recapture"] and metrics["capture_moves"] <= 4:
+            return 0.55
+        if legal_moves <= 3 and criticality < 0.45:
+            return 0.40
+        return 0.0
+
+    def _calculate_premove_delay(self, metrics):
         min_delay, max_delay = self._normal_delay_bounds()
-        upper = min(max_delay, max(0.18, min_delay + 0.25))
-        lower = min(0.08, upper)
-        return random.uniform(lower, upper)
+        criticality = self._criticality(metrics)
+
+        if metrics["legal_move_count"] == 1:
+            upper = min(self._forced_delay_max(), 0.18)
+            lower = 0.025
+        elif metrics["simple_recapture"]:
+            upper = min(max_delay, max(0.24, self._forced_delay_max() * 1.4))
+            lower = 0.05
+        elif self._is_opening_fast(metrics, criticality):
+            upper = min(max_delay, self._opening_delay_max(min_delay, max_delay), 0.45)
+            lower = 0.06
+        else:
+            upper = min(max_delay, max(0.30, min_delay + 0.18))
+            lower = 0.06
+
+        if self._our_time is not None and self._our_time <= 10:
+            upper = min(upper, 0.16)
+            lower = min(lower, 0.025)
+
+        upper = max(lower + 0.02, upper)
+        mode = lower + (upper - lower) * 0.28
+        return random.triangular(lower, upper, mode)
 
     def _should_premove(self, metrics):
         """Decide if this should be a near-instant response."""
-        if metrics["legal_move_count"] == 1:
-            return random.random() < 0.70
+        base_chance = self.config.timing_premove_chance
+        criticality = self._criticality(metrics)
+        legal_moves = metrics["legal_move_count"]
 
-        if metrics["simple_recapture"]:
-            chance = min(0.65, self.config.timing_premove_chance * 3)
-            return random.random() < chance
+        if legal_moves == 1:
+            chance = 0.94
+        elif metrics["in_check"] and legal_moves <= 2:
+            chance = max(base_chance, 0.42)
+        elif metrics["simple_recapture"]:
+            chance = max(base_chance * 4.0, 0.34)
+        elif self._is_opening_fast(metrics, criticality) and self._move_number <= 8:
+            chance = max(base_chance, 0.12)
+        elif legal_moves <= 4 and criticality < 0.35:
+            chance = max(base_chance, 0.18)
+        else:
+            chance = base_chance
 
-        return random.random() < self.config.timing_premove_chance
+        if self._last_opponent_think is not None and self._last_opponent_think < 0.7:
+            chance *= 1.35
+
+        if self._our_time is not None:
+            if self._our_time <= 3 and legal_moves <= 3:
+                chance = max(chance, 0.98)
+            elif self._our_time <= 10:
+                chance *= 1.35
+
+        if criticality >= 0.70 and legal_moves > 1 and not metrics["simple_recapture"]:
+            chance *= 0.30
+
+        return random.random() < _clamp(chance, 0.0, 0.98)
 
     def _calculate_delay(self, metrics):
         """
@@ -310,14 +456,20 @@ class HumanTiming:
         span = max(0.1, max_delay - min_delay)
 
         legal_moves = metrics["legal_move_count"]
-        hanging = metrics["hanging"]
         piece_count = metrics["piece_count"]
+        criticality = self._criticality(metrics)
+        forced_score = self._forced_score(metrics, criticality)
+        opening_fast = self._is_opening_fast(metrics, criticality)
 
-        if self._move_number <= 6:
-            phase_ratio = random.uniform(0.18, 0.35)
-        elif self._move_number <= 14:
-            phase_ratio = random.uniform(0.30, 0.55)
-        elif piece_count > 14:
+        lower_bound = min_delay
+        upper_bound = max_delay
+
+        if opening_fast:
+            phase_ratio = random.uniform(0.08, 0.22) * self._opening_bias
+            upper_bound = self._opening_delay_max(min_delay, max_delay)
+        elif metrics["fullmove_number"] <= 10:
+            phase_ratio = random.uniform(0.24, 0.45)
+        elif piece_count > 18:
             phase_ratio = random.uniform(0.45, 0.78)
         elif piece_count <= 10:
             phase_ratio = random.uniform(0.30, 0.58)
@@ -328,38 +480,69 @@ class HumanTiming:
         sigma = max(0.06, span * 0.16)
 
         if legal_moves > 35:
-            center *= 1.35
+            center *= 1.20
             sigma *= 1.20
         elif legal_moves > 25:
-            center *= 1.15
+            center *= 1.10
         elif legal_moves <= 8:
             center *= 0.78
 
-        if hanging >= 3:
-            center *= 1.45 if random.random() > 0.25 else 0.62
-            sigma *= 1.25
-        elif hanging >= 1:
-            center *= 1.15
+        if forced_score >= 1.0:
+            lower_bound = 0.04
+            upper_bound = min(max_delay, self._forced_delay_max())
+            center = random.uniform(0.07, upper_bound)
+            sigma = 0.04
+        elif forced_score > 0:
+            lower_bound = min(0.10, min_delay)
+            center *= 1.0 - forced_score * 0.55
+            sigma *= 0.75
+            if forced_score >= 0.55:
+                upper_bound = min(max_delay, max(0.42, self._forced_delay_max() * 2.0))
+
+        if criticality >= 0.48 and forced_score < 0.55:
+            critical_max = self._critical_delay_max(max_delay)
+            upper_bound = critical_max
+            center *= 1.0 + criticality * 1.25
+            center += (critical_max - max_delay) * criticality * random.uniform(0.10, 0.32)
+            sigma *= 1.0 + criticality * 0.75
+        elif criticality >= 0.28 and forced_score < 0.55:
+            center *= 1.0 + criticality * 0.55
+            sigma *= 1.0 + criticality * 0.25
 
         if metrics["in_check"]:
-            center *= 0.62 if random.random() < 0.65 else 1.18
+            if forced_score >= 0.55:
+                center *= 0.68
+            else:
+                center *= 1.10 if criticality >= 0.48 else 0.82
 
         if self._last_opponent_think is not None:
             if self._last_opponent_think < 0.8:
-                center *= 0.78
+                center *= 0.74 if criticality < 0.55 else 0.92
             elif self._last_opponent_think > 8:
-                center *= 1.08
+                center *= 1.10
 
-        center *= self._clock_pressure_factor()
+        center *= self._tempo_bias
+        clock_factor = self._clock_pressure_factor()
+        center *= clock_factor
+        if clock_factor < 0.55:
+            upper_bound = min(upper_bound, max_delay)
 
         if self._move_number > 40:
             sigma *= 1.35
 
-        delay = _gaussian_delay(center, sigma, min_delay, max_delay)
+        delay = _gaussian_delay(center, sigma, lower_bound, upper_bound)
+
+        if (
+            criticality >= 0.55
+            and forced_score < 0.55
+            and random.random() < self._hesitation_chance + criticality * 0.08
+        ):
+            delay += random.uniform(0.20, 1.10) * criticality
+            delay = _clamp(delay, lower_bound, upper_bound)
 
         if self._last_delay is not None and abs(delay - self._last_delay) < 0.08:
             delay += random.uniform(-0.18, 0.22)
-            delay = _clamp(delay, min_delay, max_delay)
+            delay = _clamp(delay, lower_bound, upper_bound)
 
         return delay
 
@@ -463,13 +646,19 @@ class HumanTiming:
         """
         Return a multiplier for engine search time.
 
-        Disabled by default because changing search time can change the move.
+        Most engine-time changes stay disabled by default because they can
+        change the selected move. A true one-legal-move position is safe to
+        shorten because there is no alternate legal move to choose.
         """
+        if metrics is None:
+            metrics = build_position_metrics(board)
+
+        if metrics["legal_move_count"] == 1:
+            return 0.05
+
         if not self.config.humanizer_adjust_engine_time:
             return 1.0
 
-        if metrics is None:
-            metrics = build_position_metrics(board)
         legal_moves = metrics["legal_move_count"]
 
         if legal_moves <= 3:

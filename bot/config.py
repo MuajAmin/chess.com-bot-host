@@ -35,6 +35,9 @@ DEFAULTS = {
         "enabled": True,
         "delay_min": 0.3,
         "delay_max": 1.5,
+        "opening_delay_max": 0.8,
+        "forced_delay_max": 0.22,
+        "critical_delay_max": 4.5,
         "premove_chance": 0.05,
     },
     "humanizer": {
@@ -178,6 +181,12 @@ class Config:
             errors.append(f"challenge.mode must be 'whitelist' or 'open', got: {self.challenge_mode}")
         if self.timing_delay_min > self.timing_delay_max:
             errors.append("timing.delay_min must be <= timing.delay_max")
+        if self.timing_opening_delay_max < 0:
+            errors.append("timing.opening_delay_max must be >= 0")
+        if self.timing_forced_delay_max <= 0:
+            errors.append("timing.forced_delay_max must be > 0")
+        if self.timing_critical_delay_max <= 0:
+            errors.append("timing.critical_delay_max must be > 0")
         if not 0 <= self.timing_premove_chance <= 1:
             errors.append("timing.premove_chance must be between 0 and 1")
         if not 0 <= self.humanizer_blunder_chance <= 1:
@@ -269,6 +278,18 @@ class Config:
     @property
     def timing_delay_max(self):
         return self._as_float(self._data["timing"].get("delay_max", 1.5), 1.5)
+
+    @property
+    def timing_opening_delay_max(self):
+        return self._as_float(self._data["timing"].get("opening_delay_max", 0.8), 0.8)
+
+    @property
+    def timing_forced_delay_max(self):
+        return self._as_float(self._data["timing"].get("forced_delay_max", 0.22), 0.22)
+
+    @property
+    def timing_critical_delay_max(self):
+        return self._as_float(self._data["timing"].get("critical_delay_max", 4.5), 4.5)
 
     @property
     def timing_premove_chance(self):

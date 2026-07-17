@@ -30,6 +30,9 @@ timing:
   enabled: true
   delay_min: 0.3             # minimum delay before move (seconds)
   delay_max: 1.5             # maximum delay before move (seconds)
+  opening_delay_max: 0.8     # quiet opening moves stay quick
+  forced_delay_max: 0.22     # one-legal-move replies can be near-instant
+  critical_delay_max: 4.5    # tactical/critical positions may think longer
   premove_chance: 0.05       # 5% chance of near-instant move
 
 humanizer:

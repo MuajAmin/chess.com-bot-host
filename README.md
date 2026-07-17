@@ -68,6 +68,9 @@ timing:
   enabled: true
   delay_min: 0.3               # Minimum base delay (seconds)
   delay_max: 1.5               # Maximum base delay (seconds)
+  opening_delay_max: 0.8       # Quiet opening moves stay quick
+  forced_delay_max: 0.22       # One-legal-move replies can be near-instant
+  critical_delay_max: 4.5      # Tactical/critical positions may think longer
   premove_chance: 0.05         # 5% baseline premove rate
 
 humanizer:
@@ -101,6 +104,9 @@ server:
 | **engine** | `type` | `auto` | `maia` forces policy-only `nodes=1`; `lc0` forces time-based search; `auto` checks the weights filename for "maia". |
 | **timing** | `enabled` | `true` | Enables human-like delays while preserving the exact engine move. |
 | **timing** | `delay_min` / `delay_max` | `0.3` / `1.5` | Normal delay range used by the timing model. Fast premove-style replies may be shorter when the move is forced or obvious. |
+| **timing** | `opening_delay_max` | `0.8` | Upper delay cap for quiet early opening moves so book-like replies stay quick. |
+| **timing** | `forced_delay_max` | `0.22` | Upper delay cap for true one-legal-move positions and obvious forced replies. |
+| **timing** | `critical_delay_max` | `4.5` | Upper delay cap for tactical positions with checks, captures, hanging material, king pressure, or promotions. |
 | **humanizer** | `change_moves` | `false` | Optional legacy behavior that can pick a lower-ranked move. Keep false when move choice must stay unchanged. |
 | **humanizer** | `adjust_engine_time` | `false` | Optional legacy behavior that changes Lc0 search time. Keep false when move choice must stay unchanged. |
 | **server** | `max_context_games`| `3` | Periodically refreshes the browser window to flush cached assets and prevent Chromium memory growth. |

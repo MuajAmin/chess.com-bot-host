@@ -111,10 +111,33 @@ class BoardParser:
                         debug: {}
                     };
 
-                    // ── Strategy 1: wc-chess-board component orientation ──
-                    // Chess.com's web component exposes the board orientation
-                    // directly as a property or attribute.
+                    // ── Strategy 0: Game controller API (from Mint.js) ──
+                    // Chess.com's wc-chess-board has a .game controller with
+                    // getOptions() that returns { isPlayerBlack, flipped, ... }
+                    // This is the MOST RELIABLE method — same as Mint.js uses.
                     const wcBoard = document.querySelector('wc-chess-board');
+                    if (wcBoard && wcBoard.game) {
+                        try {
+                            const opts = wcBoard.game.getOptions
+                                ? wcBoard.game.getOptions()
+                                : null;
+                            if (opts) {
+                                result.debug.isPlayerBlack = opts.isPlayerBlack;
+                                result.debug.isWhiteOnBottom = opts.isWhiteOnBottom;
+                                result.debug.flipped = opts.flipped;
+
+                                if (typeof opts.isPlayerBlack === 'boolean') {
+                                    result.method = 'game-controller-isPlayerBlack';
+                                    result.color = opts.isPlayerBlack ? 'black' : 'white';
+                                    return result;
+                                }
+                            }
+                        } catch(e) {
+                            result.debug.gameControllerError = e.message;
+                        }
+                    }
+
+                    // ── Strategy 1: wc-chess-board component orientation ──
                     if (wcBoard) {
                         // Check the 'flipped' property (boolean on the custom element)
                         if (typeof wcBoard.flipped === 'boolean') {
@@ -142,9 +165,6 @@ class BoardParser:
                     }
 
                     // ── Strategy 2: Board coordinate labels ──
-                    // Chess.com renders rank/file labels. If '1' is at the
-                    // bottom, board is from White's perspective. If '8' is
-                    // at the bottom, it's Black's.
                     const board = wcBoard || document.querySelector(
                         'chess-board, .board, #board-single'
                     );
@@ -152,7 +172,6 @@ class BoardParser:
                         const boardRect = board.getBoundingClientRect();
                         const boardMid = boardRect.top + boardRect.height / 2;
 
-                        // Look for coordinate elements
                         const coordEls = board.querySelectorAll(
                             '[class*="coordinate"], [class*="notation"], ' +
                             '.coords-rank text, .coords-rank span, ' +
@@ -169,10 +188,8 @@ class BoardParser:
                         }
                         result.debug.rank1Y = rank1Y;
                         result.debug.rank8Y = rank8Y;
-                        result.debug.boardMid = boardMid;
 
                         if (rank1Y !== null && rank8Y !== null) {
-                            // If rank 1 is below rank 8 → White's perspective
                             if (rank1Y > rank8Y) {
                                 result.method = 'coordinates';
                                 result.color = 'white';
@@ -185,28 +202,20 @@ class BoardParser:
                         }
                     }
 
-                    // ── Strategy 3: Piece positions on the board ──
-                    // White king starts on e1 (square-51), Black king on e8
-                    // (square-58). Check which king is at the bottom.
+                    // ── Strategy 3: Piece positions (king Y comparison) ──
                     if (board) {
-                        const boardRect = board.getBoundingClientRect();
-                        const boardMid = boardRect.top + boardRect.height / 2;
                         const pieces = board.querySelectorAll('.piece');
                         let wkY = null, bkY = null;
-
                         for (const p of pieces) {
                             const cls = (p.className || '').toString();
                             const rect = p.getBoundingClientRect();
                             const midY = rect.top + rect.height / 2;
-
                             if (cls.includes('wk')) wkY = midY;
                             if (cls.includes('bk')) bkY = midY;
                         }
-
                         result.debug.wkY = wkY;
                         result.debug.bkY = bkY;
 
-                        // If white king is below board midpoint, we're White
                         if (wkY !== null && bkY !== null) {
                             if (wkY > bkY) {
                                 result.method = 'king-position';
@@ -220,43 +229,9 @@ class BoardParser:
                         }
                     }
 
-                    // ── Strategy 4: Clock/player panel color ──
-                    const norm = (v) => (v || '').toString().trim().toLowerCase();
-                    function findClockColor(selector) {
-                        for (const el of document.querySelectorAll(selector)) {
-                            const cls = norm(el.getAttribute('class') || el.className);
-                            if (cls.includes('clock-white') || cls.includes('clock-player-white'))
-                                return 'white';
-                            if (cls.includes('clock-black') || cls.includes('clock-player-black'))
-                                return 'black';
-                        }
-                        return null;
-                    }
-
-                    // Bottom clock = our color
-                    const bottomClock = findClockColor(
-                        '.clock-bottom, [class*="clock-bottom"], ' +
-                        '.board-layout-bottom [class*="clock"]'
-                    );
-                    if (bottomClock) {
-                        result.method = 'bottom-clock-class';
-                        result.color = bottomClock;
-                        return result;
-                    }
-
-                    // Top clock = opponent's color (invert)
-                    const topClock = findClockColor(
-                        '.clock-top, [class*="clock-top"], ' +
-                        '.board-layout-top [class*="clock"]'
-                    );
-                    if (topClock) {
-                        result.method = 'top-clock-class-inverted';
-                        result.color = topClock === 'white' ? 'black' : 'white';
-                        return result;
-                    }
-
-                    // ── Strategy 5: Board flipped attribute/class ──
+                    // ── Strategy 4: Board flipped attribute/class ──
                     if (board) {
+                        const norm = (v) => (v || '').toString().trim().toLowerCase();
                         const cls = norm(board.getAttribute('class') || board.className);
                         const hasFlipped = board.hasAttribute('flipped');
                         result.debug.boardClasses = cls.substring(0, 200);
@@ -977,11 +952,36 @@ class BoardParser:
         """
         Get a python-chess Board object representing the current position.
 
-        If move replay was used, returns the replayed board directly
-        (which has correct castling rights, en-passant, etc).
-        Otherwise constructs from FEN string.
+        Tries strategies in order:
+        0. Game controller getFEN() (from Mint.js — most reliable)
+        1. Move replay (reconstructs from SAN move history)
+        2. FEN from other DOM strategies
         """
-        # Try move replay first — gives us a perfect Board object
+        # Strategy 0: Game controller API (Mint.js approach)
+        try:
+            fen = await self.page.evaluate("""
+                () => {
+                    const board = document.querySelector('wc-chess-board');
+                    if (board && board.game && board.game.getFEN) {
+                        return board.game.getFEN();
+                    }
+                    return null;
+                }
+            """)
+            if fen and "/" in fen and " " in fen:
+                try:
+                    board = chess.Board(fen)
+                    if board.is_valid():
+                        self._strategy_used = "game_controller"
+                        self._last_board = board
+                        self._last_fen = fen
+                        return board
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Strategy 1: Move replay — gives us a perfect Board object
         board = await self._parse_from_move_replay()
         if board is not None:
             self._strategy_used = "move_replay"
@@ -1004,9 +1004,37 @@ class BoardParser:
     async def _detect_turn(self):
         """Detect whose turn it is using multiple methods."""
         try:
-            # Method 1: Reuse SAN replay when possible. This is more reliable
-            # than clock CSS, because chess.com can mark the wrong clock-like
-            # element active while animations or nested timers update.
+            # Method 0: Game controller API (Mint.js approach)
+            # getTurn() returns 1 (White) or 2 (Black)
+            # getFEN() returns the full FEN — turn is the 2nd field
+            turn_result = await self.page.evaluate("""
+                () => {
+                    const board = document.querySelector('wc-chess-board');
+                    if (board && board.game) {
+                        // getTurn() returns 1=White, 2=Black
+                        if (board.game.getTurn) {
+                            const t = board.game.getTurn();
+                            if (t === 1) return 'w';
+                            if (t === 2) return 'b';
+                        }
+                        // Fallback: parse turn from FEN
+                        if (board.game.getFEN) {
+                            const fen = board.game.getFEN();
+                            if (fen) {
+                                const parts = fen.split(' ');
+                                if (parts.length >= 2) return parts[1];
+                            }
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if turn_result == 'w':
+                return chess.WHITE
+            elif turn_result == 'b':
+                return chess.BLACK
+
+            # Method 1: Reuse SAN replay when possible.
             board = await self._parse_from_move_replay()
             if board is not None:
                 return board.turn
