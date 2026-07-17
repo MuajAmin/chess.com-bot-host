@@ -720,13 +720,9 @@ class BoardParser:
                         }
                         result.debug.orientationRank1Y = rank1Y;
                         result.debug.orientationRank8Y = rank8Y;
-                        if (rank1Y !== null && rank8Y !== null) {
-                            result.orientation = rank1Y > rank8Y ? 'white' : 'black';
-                            result.orientationMethod = 'coordinates';
-                        }
-                    }
 
-                    if (!result.orientation) {
+                        // Always check king positions — pieces reflect the
+                        // actual rendered state even during board flip animation
                         const pieces = board.querySelectorAll('.piece');
                         let wkY = null;
                         let bkY = null;
@@ -740,9 +736,29 @@ class BoardParser:
                         result.debug.whiteKingY = wkY;
                         result.debug.blackKingY = bkY;
 
-                        if (wkY !== null && bkY !== null) {
-                            result.orientation = wkY > bkY ? 'white' : 'black';
+                        // Derive orientation from coordinates and kings
+                        const coordOrientation = (rank1Y !== null && rank8Y !== null)
+                            ? (rank1Y > rank8Y ? 'white' : 'black')
+                            : null;
+                        const kingOrientation = (wkY !== null && bkY !== null)
+                            ? (wkY > bkY ? 'white' : 'black')
+                            : null;
+                        result.debug.coordOrientation = coordOrientation;
+                        result.debug.kingOrientation = kingOrientation;
+
+                        // Prefer king positions over coordinate labels:
+                        // Piece positions always match the visual board state,
+                        // while coordinate labels can lag during board flip animation
+                        if (kingOrientation) {
+                            result.orientation = kingOrientation;
                             result.orientationMethod = 'king-screen-position';
+                            if (coordOrientation && coordOrientation !== kingOrientation) {
+                                result.debug.orientationConflict =
+                                    'coords=' + coordOrientation + ' vs kings=' + kingOrientation;
+                            }
+                        } else if (coordOrientation) {
+                            result.orientation = coordOrientation;
+                            result.orientationMethod = 'coordinates';
                         }
                     }
 
