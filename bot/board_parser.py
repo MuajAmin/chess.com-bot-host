@@ -91,165 +91,214 @@ class BoardParser:
             return False
 
     async def detect_our_color(self):
-        """Detect which color we are playing."""
+        """Detect which color we are playing.
+
+        Uses multiple strategies in order of reliability:
+        1. Board coordinate labels (which rank is at bottom)
+        2. Piece position on the board (king file positions)
+        3. Clock/player panel color classes
+        4. Board flipped attribute/class
+        5. Default to WHITE (last resort)
+        """
         try:
             await self.wait_for_board_ready()
 
-            # Strategy 1: use player clock color. On Chess.com the logged-in
-            # player is normally rendered at the bottom; the clock class carries
-            # the real side even when board flip attributes are absent.
-            color_data = await self.page.evaluate("""
+            color_result = await self.page.evaluate("""
                 () => {
-                    const norm = (value) => (value || '').toString().trim().toLowerCase();
-                    const text = (el) => norm(el && (el.innerText || el.textContent));
+                    const result = {
+                        method: null,
+                        color: null,
+                        debug: {}
+                    };
 
-                    function clockColor(selector) {
-                        const clock = document.querySelector(selector);
-                        if (!clock) return null;
-                        const cls = norm(clock.getAttribute('class') || clock.className);
-                        if (cls.includes('clock-white')) return 'white';
-                        if (cls.includes('clock-black')) return 'black';
+                    // ── Strategy 1: wc-chess-board component orientation ──
+                    // Chess.com's web component exposes the board orientation
+                    // directly as a property or attribute.
+                    const wcBoard = document.querySelector('wc-chess-board');
+                    if (wcBoard) {
+                        // Check the 'flipped' property (boolean on the custom element)
+                        if (typeof wcBoard.flipped === 'boolean') {
+                            result.method = 'wc-chess-board.flipped';
+                            result.color = wcBoard.flipped ? 'black' : 'white';
+                            result.debug.flippedProp = wcBoard.flipped;
+                            return result;
+                        }
+
+                        // Check the 'orientation' property
+                        const orient = wcBoard.orientation ||
+                                       wcBoard.getAttribute('orientation') || '';
+                        if (orient) {
+                            result.debug.orientation = orient;
+                            if (orient.toLowerCase() === 'black') {
+                                result.method = 'wc-chess-board.orientation';
+                                result.color = 'black';
+                                return result;
+                            } else if (orient.toLowerCase() === 'white') {
+                                result.method = 'wc-chess-board.orientation';
+                                result.color = 'white';
+                                return result;
+                            }
+                        }
+                    }
+
+                    // ── Strategy 2: Board coordinate labels ──
+                    // Chess.com renders rank/file labels. If '1' is at the
+                    // bottom, board is from White's perspective. If '8' is
+                    // at the bottom, it's Black's.
+                    const board = wcBoard || document.querySelector(
+                        'chess-board, .board, #board-single'
+                    );
+                    if (board) {
+                        const boardRect = board.getBoundingClientRect();
+                        const boardMid = boardRect.top + boardRect.height / 2;
+
+                        // Look for coordinate elements
+                        const coordEls = board.querySelectorAll(
+                            '[class*="coordinate"], [class*="notation"], ' +
+                            '.coords-rank text, .coords-rank span, ' +
+                            'svg text, .board-coordinates span'
+                        );
+
+                        let rank1Y = null, rank8Y = null;
+                        for (const el of coordEls) {
+                            const txt = (el.textContent || '').trim();
+                            const rect = el.getBoundingClientRect();
+                            const midY = rect.top + rect.height / 2;
+                            if (txt === '1') rank1Y = midY;
+                            if (txt === '8') rank8Y = midY;
+                        }
+                        result.debug.rank1Y = rank1Y;
+                        result.debug.rank8Y = rank8Y;
+                        result.debug.boardMid = boardMid;
+
+                        if (rank1Y !== null && rank8Y !== null) {
+                            // If rank 1 is below rank 8 → White's perspective
+                            if (rank1Y > rank8Y) {
+                                result.method = 'coordinates';
+                                result.color = 'white';
+                                return result;
+                            } else {
+                                result.method = 'coordinates';
+                                result.color = 'black';
+                                return result;
+                            }
+                        }
+                    }
+
+                    // ── Strategy 3: Piece positions on the board ──
+                    // White king starts on e1 (square-51), Black king on e8
+                    // (square-58). Check which king is at the bottom.
+                    if (board) {
+                        const boardRect = board.getBoundingClientRect();
+                        const boardMid = boardRect.top + boardRect.height / 2;
+                        const pieces = board.querySelectorAll('.piece');
+                        let wkY = null, bkY = null;
+
+                        for (const p of pieces) {
+                            const cls = (p.className || '').toString();
+                            const rect = p.getBoundingClientRect();
+                            const midY = rect.top + rect.height / 2;
+
+                            if (cls.includes('wk')) wkY = midY;
+                            if (cls.includes('bk')) bkY = midY;
+                        }
+
+                        result.debug.wkY = wkY;
+                        result.debug.bkY = bkY;
+
+                        // If white king is below board midpoint, we're White
+                        if (wkY !== null && bkY !== null) {
+                            if (wkY > bkY) {
+                                result.method = 'king-position';
+                                result.color = 'white';
+                                return result;
+                            } else {
+                                result.method = 'king-position';
+                                result.color = 'black';
+                                return result;
+                            }
+                        }
+                    }
+
+                    // ── Strategy 4: Clock/player panel color ──
+                    const norm = (v) => (v || '').toString().trim().toLowerCase();
+                    function findClockColor(selector) {
+                        for (const el of document.querySelectorAll(selector)) {
+                            const cls = norm(el.getAttribute('class') || el.className);
+                            if (cls.includes('clock-white') || cls.includes('clock-player-white'))
+                                return 'white';
+                            if (cls.includes('clock-black') || cls.includes('clock-player-black'))
+                                return 'black';
+                        }
                         return null;
                     }
 
-                    function playerText(selector) {
-                        const player = document.querySelector(selector);
-                        return text(player);
-                    }
-
-                    function getOwnUsername() {
-                        const profileLinks = Array.from(
-                            document.querySelectorAll('a[href*="/member/"]')
-                        );
-                        for (const link of profileLinks) {
-                            const href = norm(link.getAttribute('href'));
-                            const label = text(link);
-                            if (!href || !label) continue;
-                            const match = href.match(/\\/member\\/([^/?#]+)/i);
-                            if (match && label.includes(match[1].toLowerCase())) {
-                                return match[1].toLowerCase();
-                            }
-                        }
-                        return '';
-                    }
-
-                    const bottomColor = clockColor('.clock-bottom, [class*="clock-bottom"]');
-                    const topColor = clockColor('.clock-top, [class*="clock-top"]');
-                    const bottomText = playerText(
-                        '#board-layout-player-bottom, .board-layout-bottom, .player-bottom'
+                    // Bottom clock = our color
+                    const bottomClock = findClockColor(
+                        '.clock-bottom, [class*="clock-bottom"], ' +
+                        '.board-layout-bottom [class*="clock"]'
                     );
-                    const topText = playerText(
-                        '#board-layout-player-top, .board-layout-top, .player-top'
-                    );
-                    const ownUsername = getOwnUsername();
-
-                    let ownSide = '';
-                    if (ownUsername) {
-                        if (bottomText.includes(ownUsername)) ownSide = 'bottom';
-                        else if (topText.includes(ownUsername)) ownSide = 'top';
+                    if (bottomClock) {
+                        result.method = 'bottom-clock-class';
+                        result.color = bottomClock;
+                        return result;
                     }
 
-                    let color = null;
-                    let source = '';
-                    if (ownSide === 'bottom' && bottomColor) {
-                        color = bottomColor;
-                        source = 'own username in bottom player clock';
-                    } else if (ownSide === 'top' && topColor) {
-                        color = topColor;
-                        source = 'own username in top player clock';
-                    } else if (bottomColor) {
-                        color = bottomColor;
-                        source = 'bottom clock color';
-                    } else if (topColor) {
-                        color = topColor === 'white' ? 'black' : 'white';
-                        source = 'inferred from top clock color';
+                    // Top clock = opponent's color (invert)
+                    const topClock = findClockColor(
+                        '.clock-top, [class*="clock-top"], ' +
+                        '.board-layout-top [class*="clock"]'
+                    );
+                    if (topClock) {
+                        result.method = 'top-clock-class-inverted';
+                        result.color = topClock === 'white' ? 'black' : 'white';
+                        return result;
                     }
 
-                    return {
-                        color,
-                        source,
-                        ownUsername,
-                        ownSide,
-                        topColor,
-                        bottomColor,
-                        topText: topText.slice(0, 120),
-                        bottomText: bottomText.slice(0, 120),
-                    };
-                }
-            """)
-
-            if color_data and color_data.get("color") in ("white", "black"):
-                self._our_color = (
-                    chess.WHITE if color_data["color"] == "white" else chess.BLACK
-                )
-                logger.info(
-                    "Detected: Playing as %s (%s, own=%s, side=%s, top=%s, bottom=%s)",
-                    "WHITE" if self._our_color == chess.WHITE else "BLACK",
-                    color_data.get("source") or "clock color",
-                    color_data.get("ownUsername") or "unknown",
-                    color_data.get("ownSide") or "unknown",
-                    color_data.get("topColor") or "unknown",
-                    color_data.get("bottomColor") or "unknown",
-                )
-                return self._our_color
-
-            # Strategy 2: Check board component's flipped attribute
-            flipped = await self.page.evaluate("""
-                () => {
-                    const board = document.querySelector(
-                        'wc-chess-board, chess-board, .board, #board-single'
-                    );
+                    // ── Strategy 5: Board flipped attribute/class ──
                     if (board) {
-                        const cls = (board.getAttribute('class') || board.className || '').toString().toLowerCase();
-                        const attrs = [
-                            board.getAttribute('orientation') || '',
-                            board.getAttribute('data-orientation') || '',
-                            board.getAttribute('data-board-orientation') || '',
-                            board.getAttribute('data-flipped') || '',
-                            board.getAttribute('flipped') || '',
-                        ].join(' ').toLowerCase();
+                        const cls = norm(board.getAttribute('class') || board.className);
+                        const hasFlipped = board.hasAttribute('flipped');
+                        result.debug.boardClasses = cls.substring(0, 200);
+                        result.debug.hasFlippedAttr = hasFlipped;
 
-                        // Check 'flipped' attribute (boolean attribute)
-                        if (board.hasAttribute('flipped')) return true;
-                        // Check flipped property
-                        if (board.flipped === true) return true;
-                        // Check class
                         if (
-                            cls.includes('flipped') ||
-                            cls.includes('orientation-black') ||
-                            cls.includes('black-bottom') ||
-                            attrs.includes('black') ||
-                            attrs.includes('true')
-                        ) {
-                            return true;
-                        }
-                    }
-                    // Fallback: check for flipped class on any board container
-                    const containers = document.querySelectorAll(
-                        '.board, .board-layout-main, [class*="board"]'
-                    );
-                    for (const c of containers) {
-                        const cls = (c.getAttribute('class') || c.className || '').toString().toLowerCase();
-                        if (
+                            hasFlipped ||
                             cls.includes('flipped') ||
                             cls.includes('orientation-black') ||
                             cls.includes('black-bottom')
                         ) {
-                            return true;
+                            result.method = 'board-flipped-class';
+                            result.color = 'black';
+                            return result;
                         }
                     }
-                    return false;
+
+                    // ── No strategy succeeded ──
+                    return result;
                 }
             """)
 
-            if flipped:
-                self._our_color = chess.BLACK
-                logger.info("Detected: Playing as BLACK")
-            else:
-                self._our_color = chess.WHITE
-                logger.info("Detected: Playing as WHITE")
+            if color_result and color_result.get("color") in ("white", "black"):
+                self._our_color = (
+                    chess.WHITE if color_result["color"] == "white" else chess.BLACK
+                )
+                logger.info(
+                    "Detected: Playing as %s (method: %s, debug: %s)",
+                    "WHITE" if self._our_color == chess.WHITE else "BLACK",
+                    color_result.get("method", "unknown"),
+                    color_result.get("debug", {}),
+                )
+                return self._our_color
 
-            return self._our_color
+            # No strategy worked — log diagnostic info and default to WHITE
+            logger.warning(
+                "Color detection: ALL strategies failed! Debug: %s. "
+                "Defaulting to WHITE.",
+                color_result.get("debug", {}) if color_result else "no result",
+            )
+            self._our_color = chess.WHITE
+            return chess.WHITE
 
         except Exception as e:
             logger.warning("Color detection failed, defaulting to WHITE: %s", e)

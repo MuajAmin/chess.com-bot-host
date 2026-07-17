@@ -14,6 +14,15 @@ import chess
 
 logger = logging.getLogger(__name__)
 
+_PIECE_VALUES = {
+    chess.PAWN: 1.0,
+    chess.KNIGHT: 3.0,
+    chess.BISHOP: 3.0,
+    chess.ROOK: 5.0,
+    chess.QUEEN: 9.0,
+    chess.KING: 0.0,
+}
+
 
 def _clamp(value, min_val, max_val):
     return max(min_val, min(max_val, value))
@@ -28,12 +37,21 @@ def _gaussian_delay(center, sigma, min_val=0.1, max_val=10.0):
     return _clamp(delay, min_val, max_val)
 
 
-def _count_hanging_pieces(board):
+def _piece_value(piece):
+    if piece is None:
+        return 0.0
+    return _PIECE_VALUES.get(piece.piece_type, 0.0)
+
+
+def _hanging_summary(board):
     """
-    Estimate the number of attacked and under-defended pieces.
+    Estimate attacked and under-defended pieces.
     This is a rough proxy for tactical complexity.
     """
     hanging = 0
+    material = 0.0
+    high_value = False
+
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece is None:
@@ -46,8 +64,76 @@ def _count_hanging_pieces(board):
         defenders = board.attackers(piece.color, square)
         if not defenders or len(attackers) > len(defenders):
             hanging += 1
+            material += _piece_value(piece)
+            high_value = high_value or piece.piece_type in (chess.ROOK, chess.QUEEN)
 
+    return hanging, material, high_value
+
+
+def _count_hanging_pieces(board):
+    """
+    Estimate the number of attacked and under-defended pieces.
+    This is a rough proxy for tactical complexity.
+    """
+    hanging, _, _ = _hanging_summary(board)
     return hanging
+
+
+def _capture_value(board, move):
+    if board.is_en_passant(move):
+        return _PIECE_VALUES[chess.PAWN]
+
+    captured = board.piece_at(move.to_square)
+    return _piece_value(captured)
+
+
+def _nearby_squares(square):
+    file_idx = chess.square_file(square)
+    rank_idx = chess.square_rank(square)
+
+    for file_delta in (-1, 0, 1):
+        for rank_delta in (-1, 0, 1):
+            next_file = file_idx + file_delta
+            next_rank = rank_idx + rank_delta
+            if 0 <= next_file <= 7 and 0 <= next_rank <= 7:
+                yield chess.square(next_file, next_rank)
+
+
+def _king_pressure(board, color):
+    king_square = board.king(color)
+    if king_square is None:
+        return 0
+
+    pressure = 0
+    enemy = not color
+    for square in _nearby_squares(king_square):
+        pressure += min(2, len(board.attackers(enemy, square)))
+
+    return pressure
+
+
+def _forcing_move_summary(board, legal_moves):
+    captures = 0
+    checks = 0
+    promotions = 0
+    max_capture_value = 0.0
+
+    for move in legal_moves:
+        if board.is_capture(move):
+            captures += 1
+            max_capture_value = max(max_capture_value, _capture_value(board, move))
+
+        if move.promotion:
+            promotions += 1
+
+        board.push(move)
+        try:
+            if board.is_check():
+                checks += 1
+        finally:
+            board.pop()
+
+    return captures, checks, promotions, max_capture_value
 
 
 def _is_simple_recapture(board, legal_moves=None):
@@ -69,12 +155,24 @@ def _is_simple_recapture(board, legal_moves=None):
 def build_position_metrics(board):
     """Compute per-position values once and reuse them for timing decisions."""
     legal_moves = tuple(board.legal_moves)
+    hanging, hanging_material, high_value_hanging = _hanging_summary(board)
+    captures, checks, promotions, max_capture_value = _forcing_move_summary(board, legal_moves)
+
     return {
         "legal_moves": legal_moves,
         "legal_move_count": len(legal_moves),
-        "hanging": _count_hanging_pieces(board),
+        "fullmove_number": board.fullmove_number,
+        "ply": len(board.move_stack),
+        "hanging": hanging,
+        "hanging_material": hanging_material,
+        "high_value_hanging": high_value_hanging,
         "piece_count": len(board.piece_map()),
         "in_check": board.is_check(),
+        "capture_moves": captures,
+        "check_moves": checks,
+        "promotion_moves": promotions,
+        "max_capture_value": max_capture_value,
+        "king_pressure": _king_pressure(board, board.turn),
         "simple_recapture": _is_simple_recapture(board, legal_moves),
     }
 
@@ -98,6 +196,9 @@ class HumanTiming:
         """Reset state for a new game."""
         self._move_number = 0
         self._total_think_time = 0.0
+        self._tempo_bias = random.uniform(0.86, 1.14)
+        self._opening_bias = random.uniform(0.72, 0.95)
+        self._hesitation_chance = random.uniform(0.04, 0.10)
         self._base_time = None
         self._increment = None
         self._our_time = None
@@ -151,8 +252,14 @@ class HumanTiming:
             metrics = build_position_metrics(board)
 
         if self._should_premove(metrics):
-            delay = self._calculate_premove_delay()
-            logger.debug("Timing premove delay: %.2fs (move #%d)", delay, self._move_number)
+            delay = self._calculate_premove_delay(metrics)
+            logger.debug(
+                "Timing premove delay: %.2fs (move #%d, legal=%d, criticality=%.2f)",
+                delay,
+                self._move_number,
+                metrics["legal_move_count"],
+                self._criticality(metrics),
+            )
             await asyncio.sleep(delay)
             self._remember_delay(delay)
             return
@@ -161,10 +268,11 @@ class HumanTiming:
         self._total_think_time += delay
 
         logger.debug(
-            "Timing delay: %.2fs (move #%d, total_delay: %.1fs)",
+            "Timing delay: %.2fs (move #%d, total_delay: %.1fs, criticality=%.2f)",
             delay,
             self._move_number,
             self._total_think_time,
+            self._criticality(metrics),
         )
         await asyncio.sleep(delay)
         self._remember_delay(delay)
