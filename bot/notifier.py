@@ -14,6 +14,7 @@ Silently disabled when webhook_url is not configured.
 import logging
 import asyncio
 import re
+import os
 import urllib.parse as urlparse
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,11 @@ class Notifier:
     """
 
     def __init__(self, config):
-        raw_url = config.webhook_url.strip() if config.webhook_url else ""
+        # Support environment variable override for security (e.g. VPS envs)
+        raw_url = os.environ.get("BOT_WEBHOOK_URL") or os.environ.get("TELEGRAM_WEBHOOK_URL") or config.webhook_url
+        raw_url = raw_url.strip() if raw_url else ""
         self._webhook_url = raw_url
+        self._background_tasks = set()
 
         # Support shorthand scheme formats:
         # - telegram://TOKEN/CHAT_ID
@@ -114,7 +118,15 @@ class Notifier:
             msg = re.sub(r'</?b>', '**', message)
             msg = re.sub(r'</?i>', '*', msg)
             msg = re.sub(r'</?u>', '__', msg)
-            msg = re.sub(r'</?code>', '`', msg)
+            
+            # Formats <code> tag to multi-line codeblock or inline codeblock
+            def _replace_code(match):
+                content = match.group(1)
+                if "\n" in content:
+                    return f"\n```\n{content}\n```\n"
+                return f"`{content}`"
+            
+            msg = re.sub(r'<code>(.*?)</code>', _replace_code, msg, flags=re.DOTALL)
             return msg
 
         # Generic webhook or fallback: strip all HTML tags
@@ -157,6 +169,13 @@ class Notifier:
                     }
                     response = await self._client.post(self._webhook_url, json=payload)
 
+                if response.status_code == 429:
+                    # Rate limit handling: retry-after
+                    retry_after = int(response.headers.get("Retry-After", 1))
+                    logger.warning("Webhook rate limited (429). Retrying after %ds...", retry_after)
+                    await asyncio.sleep(retry_after)
+                    continue
+
                 if response.status_code >= 400:
                     logger.warning(
                         "Webhook returned %d (Attempt %d/%d): %s",
@@ -178,8 +197,27 @@ class Notifier:
                 logger.warning("Webhook notification failed: %s", e)
                 break
 
+    def notify_background(self, message):
+        """
+        Schedules a notification in the background without blocking the main loop execution.
+        Useful for non-blocking error/game updates.
+        """
+        if not self._enabled:
+            return None
+        
+        task = asyncio.create_task(self.notify(message))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def close(self):
-        """Close the reusable HTTP client."""
+        """Close the reusable HTTP client and wait for background tasks."""
+        if self._background_tasks:
+            pending = list(self._background_tasks)
+            if pending:
+                logger.debug("Flushing %d pending background notifications...", len(pending))
+                await asyncio.wait(pending, timeout=3.0)
+        
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -219,7 +257,13 @@ class Notifier:
 
     async def error(self, message):
         """Notify about an error."""
-        await self.notify(f"🚨 <b>Bot Error</b>\n{message}")
+        # Wrap long or multi-line error details in monospace code tags
+        if "\n" in message or len(message) > 100:
+            formatted_msg = f"🚨 <b>Bot Error</b>\n<code>{message}</code>"
+        else:
+            formatted_msg = f"🚨 <b>Bot Error</b>\n{message}"
+        
+        await self.notify(formatted_msg)
 
     async def daily_limit_reached(self, games_count):
         """Notify that daily game limit was reached."""
