@@ -68,25 +68,77 @@ class BoardParser:
     def is_white(self):
         return self._our_color == chess.WHITE
 
+    async def wait_for_board_ready(self, timeout_ms=15000):
+        """Wait until the playable board is visible enough to parse and click."""
+        try:
+            await self.page.wait_for_function(
+                """
+                () => {
+                    const board = document.querySelector(
+                        'wc-chess-board, chess-board, .board, #board-single'
+                    );
+                    if (!board) return false;
+
+                    const rect = board.getBoundingClientRect();
+                    return rect.width >= 100 && rect.height >= 100;
+                }
+                """,
+                timeout=timeout_ms,
+            )
+            return True
+        except Exception as e:
+            logger.warning("Board did not become ready within %.1fs: %s", timeout_ms / 1000, e)
+            return False
+
     async def detect_our_color(self):
         """Detect which color we are playing."""
         try:
+            await self.wait_for_board_ready()
+
             # Strategy 1: Check board component's flipped attribute
             flipped = await self.page.evaluate("""
                 () => {
-                    const board = document.querySelector('wc-chess-board');
+                    const board = document.querySelector(
+                        'wc-chess-board, chess-board, .board, #board-single'
+                    );
                     if (board) {
+                        const cls = (board.getAttribute('class') || board.className || '').toString().toLowerCase();
+                        const attrs = [
+                            board.getAttribute('orientation') || '',
+                            board.getAttribute('data-orientation') || '',
+                            board.getAttribute('data-board-orientation') || '',
+                            board.getAttribute('data-flipped') || '',
+                            board.getAttribute('flipped') || '',
+                        ].join(' ').toLowerCase();
+
                         // Check 'flipped' attribute (boolean attribute)
                         if (board.hasAttribute('flipped')) return true;
                         // Check flipped property
                         if (board.flipped === true) return true;
                         // Check class
-                        if (board.className && board.className.includes('flipped')) return true;
+                        if (
+                            cls.includes('flipped') ||
+                            cls.includes('orientation-black') ||
+                            cls.includes('black-bottom') ||
+                            attrs.includes('black') ||
+                            attrs.includes('true')
+                        ) {
+                            return true;
+                        }
                     }
                     // Fallback: check for flipped class on any board container
-                    const containers = document.querySelectorAll('.board, .board-layout-main');
+                    const containers = document.querySelectorAll(
+                        '.board, .board-layout-main, [class*="board"]'
+                    );
                     for (const c of containers) {
-                        if (c.className.includes('flipped')) return true;
+                        const cls = (c.getAttribute('class') || c.className || '').toString().toLowerCase();
+                        if (
+                            cls.includes('flipped') ||
+                            cls.includes('orientation-black') ||
+                            cls.includes('black-bottom')
+                        ) {
+                            return true;
+                        }
                     }
                     return false;
                 }

@@ -21,6 +21,36 @@ _NAVIGATION_SETTLE_MS = 500
 _POST_ACCEPT_SETTLE_MS = 250
 _GAME_VERIFY_TIMEOUT_MS = 15000
 _GAME_VERIFY_POLL_MS = 250
+_GAME_URL_PARTS = ("/game/live/", "/game/daily/", "/play/game/")
+_GAME_BOARD_PROBE = """
+    () => {
+        const board = document.querySelector(
+            'wc-chess-board, chess-board, .board, #board-single'
+        );
+        if (!board) return false;
+
+        const rect = board.getBoundingClientRect();
+        if (rect.width < 100 || rect.height < 100) return false;
+
+        return !!document.querySelector(
+            '[class*="clock"], [class*="timer"], [class*="time-component"], ' +
+            '[class*="resign"], [class*="draw"], [class*="abort"]'
+        );
+    }
+"""
+
+
+def _is_game_url(url):
+    return any(part in (url or "") for part in _GAME_URL_PARTS)
+
+
+def _is_navigation_handoff_error(error):
+    message = str(error).lower()
+    return (
+        "execution context was destroyed" in message or
+        "navigation" in message or
+        "target closed" in message
+    )
 
 
 class ChallengeListener:
@@ -786,58 +816,97 @@ class ChallengeListener:
         """
         try:
             deadline = asyncio.get_running_loop().time() + (_GAME_VERIFY_TIMEOUT_MS / 1000)
+            url_candidate = None
+            url_seen_at = None
+
             while asyncio.get_running_loop().time() < deadline:
-                url = self.page.url
-                if "/game/live/" in url or "/game/daily/" in url or "/play/game/" in url:
-                    logger.debug("Post-accept URL: %s", url)
-                    return True
+                now = asyncio.get_running_loop().time()
 
-                try:
-                    has_game_board = await self.page.evaluate("""
-                        () => {
-                            const board = document.querySelector(
-                                'wc-chess-board, chess-board, [class*="board"]'
-                            );
-                            if (!board) return false;
-                            return !!document.querySelector(
-                                '[class*="clock"], [class*="timer"], [class*="time-component"], ' +
-                                '[class*="resign"], [class*="draw"], [class*="abort"]'
-                            );
-                        }
-                    """)
-                except Exception as e:
-                    # A challenge accept normally triggers an SPA/full navigation. During
-                    # that handoff Playwright can lose the current execution context; keep
-                    # polling instead of treating the accepted challenge as failed.
-                    message = str(e).lower()
-                    if (
-                        "execution context was destroyed" in message or
-                        "navigation" in message or
-                        "target closed" in message
-                    ):
-                        try:
-                            await self.page.wait_for_load_state(
-                                "domcontentloaded",
-                                timeout=_GAME_VERIFY_POLL_MS,
-                            )
-                        except Exception:
-                            pass
-                        await asyncio.sleep(_GAME_VERIFY_POLL_MS / 1000)
-                        continue
-                    raise
+                for page in self._candidate_pages():
+                    if _is_game_url(page.url):
+                        if url_candidate is None or page == self.page:
+                            url_candidate = page
+                            url_seen_at = url_seen_at or now
 
-                if has_game_board:
-                    logger.info("Game board with clock/controls detected on page")
-                    return True
+                    if await self._page_has_game_board(page):
+                        await self._adopt_game_page(page, "board probe")
+                        return True
+
+                if url_candidate is not None and url_seen_at is not None:
+                    # If the URL is already a game URL but the board is still
+                    # rendering, hand off after a short wait. The worker and
+                    # parser also wait for the board before playing.
+                    if now - url_seen_at >= 2.5:
+                        await self._adopt_game_page(url_candidate, "game URL")
+                        return True
 
                 await asyncio.sleep(_GAME_VERIFY_POLL_MS / 1000)
 
-            logger.warning("Not on a game page. URL: %s", self.page.url)
+            if url_candidate is not None:
+                await self._adopt_game_page(url_candidate, "game URL timeout fallback")
+                return True
+
+            logger.warning(
+                "Not on a game page. Pages seen: %s",
+                [page.url for page in self._candidate_pages()],
+            )
             return False
 
         except Exception as e:
             logger.error("Game verification error: %s", e)
             return False
+
+    def _candidate_pages(self):
+        """Return current context pages, with the listener page first."""
+        try:
+            pages = [
+                page
+                for page in self.page.context.pages
+                if not page.is_closed()
+            ]
+        except Exception:
+            pages = [self.page] if not self.page.is_closed() else []
+
+        ordered = []
+        if not self.page.is_closed():
+            ordered.append(self.page)
+        for page in pages:
+            if page not in ordered:
+                ordered.append(page)
+        return ordered
+
+    async def _page_has_game_board(self, page):
+        try:
+            return bool(await page.evaluate(_GAME_BOARD_PROBE))
+        except Exception as e:
+            # A challenge accept normally triggers an SPA/full navigation. During
+            # that handoff Playwright can lose the current execution context; keep
+            # polling instead of treating the accepted challenge as failed.
+            if _is_navigation_handoff_error(e):
+                try:
+                    await page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=_GAME_VERIFY_POLL_MS,
+                    )
+                except Exception:
+                    pass
+                return False
+            logger.debug("Game board probe failed for %s: %s", page.url, e)
+            return False
+
+    async def _adopt_game_page(self, page, reason):
+        if page != self.page:
+            logger.info("Switching active page after accept via %s: %s", reason, page.url[:120])
+            self.page = page
+        else:
+            logger.info("Game page verified via %s: %s", reason, page.url[:120])
+
+        try:
+            self.page.set_default_timeout(5000)
+            self.page.set_default_navigation_timeout(20000)
+            await self.page.bring_to_front()
+        except Exception:
+            pass
 
     async def _debug_challenge_dom(self, challenge_el):
         """Dump challenge element HTML and take screenshot for debugging."""

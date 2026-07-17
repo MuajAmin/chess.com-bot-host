@@ -79,8 +79,11 @@ async def _select_game_page(browser):
     """
     deadline = asyncio.get_running_loop().time() + GAME_PAGE_WAIT_SECONDS
     last_urls = []
+    url_candidate = None
+    url_seen_at = None
 
     while asyncio.get_running_loop().time() < deadline:
+        now = asyncio.get_running_loop().time()
         pages = [
             page
             for context in browser.contexts
@@ -90,16 +93,33 @@ async def _select_game_page(browser):
         last_urls = [page.url for page in pages]
 
         for page in pages:
-            if _is_game_url(page.url):
-                logger.info("Selected game page by URL: %s", page.url[:120])
-                return page
-
-        for page in pages:
             if await _page_has_game_board(page):
                 logger.info("Selected game page by board probe: %s", page.url[:120])
                 return page
 
+        for page in pages:
+            if _is_game_url(page.url):
+                if url_candidate is None:
+                    url_candidate = page
+                    url_seen_at = now
+
+        if url_candidate is not None and url_candidate.is_closed():
+            url_candidate = None
+            url_seen_at = None
+
+        if url_candidate is not None and url_seen_at is not None:
+            if now - url_seen_at >= 2.5:
+                logger.info("Selected game page by URL: %s", url_candidate.url[:120])
+                return url_candidate
+
         await asyncio.sleep(0.25)
+
+    if url_candidate is not None and not url_candidate.is_closed():
+        logger.warning(
+            "Using game URL page without board probe success: %s",
+            url_candidate.url[:120],
+        )
+        return url_candidate
 
     logger.error("No active game page found via CDP. Pages seen: %s", last_urls)
     return None

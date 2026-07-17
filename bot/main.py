@@ -360,6 +360,9 @@ async def main():
 
             if challenge_accepted:
                 logger.info("Challenge accepted! Initializing game...")
+                session.adopt_page(challenge_listener.page)
+                page = session.page
+                game_tracker.page = page
                 game_tracker.start_game()
 
                 if subprocess_available:

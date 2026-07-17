@@ -105,6 +105,16 @@ class SessionManager:
             raise RuntimeError("Session not initialized. Call login() first.")
         return self._page
 
+    def adopt_page(self, page: Page) -> None:
+        """Make an existing context page the active page for game handling."""
+        if page is None or page.is_closed():
+            return
+
+        self._page = page
+        self._page.set_default_timeout(5000)
+        self._page.set_default_navigation_timeout(20000)
+        logger.debug("Active page updated: %s", self._page.url[:120])
+
     @property
     def ws_endpoint(self) -> str:
         """
