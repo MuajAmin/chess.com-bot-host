@@ -389,12 +389,22 @@ class BoardParser:
                     // Helper: extract only the SAN move text from a node,
                     // excluding nested time/clock elements (e.g. <span>1s</span>)
                     function getMoveText(node) {
+                        function withFigurine(root, value) {
+                            let text = (value || '').trim();
+                            const figurine = root.querySelector('[data-figurine]');
+                            const piece = figurine ? figurine.getAttribute('data-figurine') : '';
+                            if (piece && !text.startsWith(piece)) {
+                                text = piece + text;
+                            }
+                            return text.replace(/\\s+/g, '');
+                        }
+
                         // Strategy: try to find a dedicated move-text child first
                         const moveSpan = node.querySelector(
                             '.node-highlight-content, [data-cy="move-san"], .move-san'
                         );
                         if (moveSpan) {
-                            return moveSpan.textContent.trim();
+                            return withFigurine(moveSpan, moveSpan.textContent);
                         }
 
                         // Fallback: collect only direct text nodes (skip child elements
@@ -406,13 +416,13 @@ class BoardParser:
                             }
                         }
                         directText = directText.trim();
-                        if (directText) return directText;
+                        if (directText) return withFigurine(node, directText);
 
                         // Last resort: full textContent but strip time suffixes
                         let text = node.textContent.trim();
                         // Remove embedded time notations like " 1s", " 0.3s", " 12.5s"
                         text = text.replace(/\\s+\\d+\\.?\\d*s\\b/gi, '').trim();
-                        return text;
+                        return withFigurine(node, text);
                     }
 
                     // Method A: data-ply attribute elements (most reliable)
