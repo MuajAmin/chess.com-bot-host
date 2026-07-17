@@ -1092,6 +1092,30 @@ class BoardParser:
                             orientation_method = "bot-color+username-position"
 
                     if bot_color in ("white", "black"):
+                        # Cross-check: if color was inferred from orientation
+                        # (not from game API), verify orientation with a
+                        # document-level piece query. The snapshot's board.querySelectorAll
+                        # can miss pieces outside the board element.
+                        if color_method in (
+                            "player-panel-username",
+                            "board-orientation+username-position",
+                        ):
+                            verified_orientation = await self._verify_orientation_from_pieces()
+                            if verified_orientation and verified_orientation != orientation:
+                                logger.warning(
+                                    "Orientation cross-check: snapshot said '%s' (%s) "
+                                    "but pieces show '%s'. Correcting.",
+                                    orientation, orientation_method, verified_orientation,
+                                )
+                                orientation = verified_orientation
+                                orientation_method = "piece-position-crosscheck"
+                                # Recalculate color from corrected orientation
+                                if bot_side == "bottom":
+                                    bot_color = orientation
+                                else:
+                                    bot_color = "black" if orientation == "white" else "white"
+                                color_method = "player-panel-username+crosscheck"
+
                         self._set_colors(bot_color=bot_color, board_orientation=orientation, bot_side=bot_side)
 
                         if self._board_orientation is None:
@@ -1131,6 +1155,100 @@ class BoardParser:
             self._set_colors(bot_color="white", board_orientation="white", bot_side="bottom")
             self._log_color_detection(snapshot, "exception-default-white", "exception-default-white")
             return self._our_color
+
+    async def _verify_orientation_from_pieces(self):
+        """
+        Independent orientation check using document-level piece queries.
+
+        The game controller snapshot uses board.querySelectorAll which can miss
+        pieces that are siblings of the board element rather than children.
+        This method uses document.querySelectorAll('.piece') — the same
+        technique as the CSS class FEN strategy (which is proven to work).
+
+        Returns 'white', 'black', or None if pieces can't be found.
+        """
+        try:
+            result = await self.page.evaluate("""
+                () => {
+                    const pieces = document.querySelectorAll('.piece');
+                    if (!pieces || pieces.length === 0) return null;
+
+                    let wkY = null;
+                    let bkY = null;
+                    let topWhite = 0;
+                    let topBlack = 0;
+                    let bottomWhite = 0;
+                    let bottomBlack = 0;
+
+                    // Find the board to determine midpoint
+                    const board = document.querySelector(
+                        'wc-chess-board, chess-board, .board, #board-single'
+                    );
+                    if (!board) return null;
+                    const boardRect = board.getBoundingClientRect();
+                    if (boardRect.width < 100 || boardRect.height < 100) return null;
+                    const boardMidY = boardRect.top + boardRect.height / 2;
+
+                    for (const piece of pieces) {
+                        const cls = (piece.className || '').toString();
+                        const rect = piece.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) continue;
+                        const midY = rect.top + rect.height / 2;
+
+                        // King positions
+                        if (cls.includes('wk')) wkY = midY;
+                        if (cls.includes('bk')) bkY = midY;
+
+                        // Piece colors by position
+                        if (midY < boardMidY) {
+                            if (/\\bw[pnbrqk]\\b/.test(cls)) topWhite++;
+                            if (/\\bb[pnbrqk]\\b/.test(cls)) topBlack++;
+                        } else {
+                            if (/\\bw[pnbrqk]\\b/.test(cls)) bottomWhite++;
+                            if (/\\bb[pnbrqk]\\b/.test(cls)) bottomBlack++;
+                        }
+                    }
+
+                    return {
+                        pieceCount: pieces.length,
+                        wkY, bkY,
+                        topWhite, topBlack,
+                        bottomWhite, bottomBlack,
+                    };
+                }
+            """)
+
+            if not result:
+                logger.debug("Orientation cross-check: no pieces found via document query")
+                return None
+
+            logger.info(
+                "Orientation cross-check: pieces=%d, wkY=%s, bkY=%s, "
+                "bottomWhite=%d, bottomBlack=%d, topWhite=%d, topBlack=%d",
+                result.get("pieceCount", 0),
+                result.get("wkY"), result.get("bkY"),
+                result.get("bottomWhite", 0), result.get("bottomBlack", 0),
+                result.get("topWhite", 0), result.get("topBlack", 0),
+            )
+
+            wk_y = result.get("wkY")
+            bk_y = result.get("bkY")
+
+            # Primary: king positions
+            if wk_y is not None and bk_y is not None:
+                return "white" if wk_y > bk_y else "black"
+
+            # Secondary: piece color distribution
+            bottom_white = result.get("bottomWhite", 0)
+            bottom_black = result.get("bottomBlack", 0)
+            if bottom_white > 0 or bottom_black > 0:
+                return "white" if bottom_white > bottom_black else "black"
+
+            return None
+
+        except Exception as e:
+            logger.debug("Orientation cross-check failed: %s", e)
+            return None
 
     def _log_failed_color_detection(self, snapshot):
         """Log comprehensive diagnostic info when color detection fails."""
