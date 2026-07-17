@@ -95,7 +95,105 @@ class BoardParser:
         try:
             await self.wait_for_board_ready()
 
-            # Strategy 1: Check board component's flipped attribute
+            # Strategy 1: use player clock color. On Chess.com the logged-in
+            # player is normally rendered at the bottom; the clock class carries
+            # the real side even when board flip attributes are absent.
+            color_data = await self.page.evaluate("""
+                () => {
+                    const norm = (value) => (value || '').toString().trim().toLowerCase();
+                    const text = (el) => norm(el && (el.innerText || el.textContent));
+
+                    function clockColor(selector) {
+                        const clock = document.querySelector(selector);
+                        if (!clock) return null;
+                        const cls = norm(clock.getAttribute('class') || clock.className);
+                        if (cls.includes('clock-white')) return 'white';
+                        if (cls.includes('clock-black')) return 'black';
+                        return null;
+                    }
+
+                    function playerText(selector) {
+                        const player = document.querySelector(selector);
+                        return text(player);
+                    }
+
+                    function getOwnUsername() {
+                        const profileLinks = Array.from(
+                            document.querySelectorAll('a[href*="/member/"]')
+                        );
+                        for (const link of profileLinks) {
+                            const href = norm(link.getAttribute('href'));
+                            const label = text(link);
+                            if (!href || !label) continue;
+                            const match = href.match(/\\/member\\/([^/?#]+)/i);
+                            if (match && label.includes(match[1].toLowerCase())) {
+                                return match[1].toLowerCase();
+                            }
+                        }
+                        return '';
+                    }
+
+                    const bottomColor = clockColor('.clock-bottom, [class*="clock-bottom"]');
+                    const topColor = clockColor('.clock-top, [class*="clock-top"]');
+                    const bottomText = playerText(
+                        '#board-layout-player-bottom, .board-layout-bottom, .player-bottom'
+                    );
+                    const topText = playerText(
+                        '#board-layout-player-top, .board-layout-top, .player-top'
+                    );
+                    const ownUsername = getOwnUsername();
+
+                    let ownSide = '';
+                    if (ownUsername) {
+                        if (bottomText.includes(ownUsername)) ownSide = 'bottom';
+                        else if (topText.includes(ownUsername)) ownSide = 'top';
+                    }
+
+                    let color = null;
+                    let source = '';
+                    if (ownSide === 'bottom' && bottomColor) {
+                        color = bottomColor;
+                        source = 'own username in bottom player clock';
+                    } else if (ownSide === 'top' && topColor) {
+                        color = topColor;
+                        source = 'own username in top player clock';
+                    } else if (bottomColor) {
+                        color = bottomColor;
+                        source = 'bottom clock color';
+                    } else if (topColor) {
+                        color = topColor === 'white' ? 'black' : 'white';
+                        source = 'inferred from top clock color';
+                    }
+
+                    return {
+                        color,
+                        source,
+                        ownUsername,
+                        ownSide,
+                        topColor,
+                        bottomColor,
+                        topText: topText.slice(0, 120),
+                        bottomText: bottomText.slice(0, 120),
+                    };
+                }
+            """)
+
+            if color_data and color_data.get("color") in ("white", "black"):
+                self._our_color = (
+                    chess.WHITE if color_data["color"] == "white" else chess.BLACK
+                )
+                logger.info(
+                    "Detected: Playing as %s (%s, own=%s, side=%s, top=%s, bottom=%s)",
+                    "WHITE" if self._our_color == chess.WHITE else "BLACK",
+                    color_data.get("source") or "clock color",
+                    color_data.get("ownUsername") or "unknown",
+                    color_data.get("ownSide") or "unknown",
+                    color_data.get("topColor") or "unknown",
+                    color_data.get("bottomColor") or "unknown",
+                )
+                return self._our_color
+
+            # Strategy 2: Check board component's flipped attribute
             flipped = await self.page.evaluate("""
                 () => {
                     const board = document.querySelector(
